@@ -98,8 +98,10 @@ async def gather_environment_config() -> dict[str, Any]:
         flink_bin = flink_home / "bin" / "flink"
         config["flink"]["binary_exists"] = flink_bin.exists()
 
-        # Flink 1.20+ uses config.yaml
-        flink_conf = flink_home / "conf" / "config.yaml"
+        # Flink 1.20+ uses config.yaml — prefer the runtime overlay
+        from cybersec.flink_paths import flink_conf_dir
+
+        flink_conf = flink_conf_dir(flink_home) / "config.yaml"
         if flink_conf.exists():
             try:
                 import yaml

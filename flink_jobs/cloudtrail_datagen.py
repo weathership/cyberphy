@@ -17,6 +17,7 @@ from pyflink.table import StreamTableEnvironment, DataTypes, EnvironmentSettings
 from pyflink.table.expressions import col
 from pyflink.table.udf import udf
 import json
+import os
 import random
 from datetime import datetime, timezone
 
@@ -339,16 +340,18 @@ class CloudTrailDataGen:
 
 def create_cloudtrail_datagen_job():
     """Create and run CloudTrail data generation job"""
-    import os
-    
-    # Set Flink configuration to use JARs from the Flink distribution
-    flink_home = os.path.join(os.getcwd(), "thirdparty/flink/flink-dist/target/flink-1.20.1-bin/flink-1.20.1")
-    os.environ.setdefault('FLINK_HOME', flink_home)
-    
+    from cybersec.flink_paths import checkpoint_uri, flink_home as resolve_flink_home
+
+    # Relocatable: FLINK_HOME or repo-relative dist — never os.getcwd() + a baked tree.
+    # Iceberg connectors are installed into $FLINK_HOME/lib by flink-bootstrap;
+    # do not set pipeline.jars=file://… (that freezes the submitter path in the job graph).
+    flink_home = resolve_flink_home()
+    os.environ.setdefault("FLINK_HOME", str(flink_home))
+
     # Create streaming environment
     env = StreamExecutionEnvironment.get_execution_environment()
     env.set_parallelism(1)
-    
+
     # Enable checkpointing for data commits
     # Checkpoints trigger Iceberg commits - without this, data stays buffered!
     env.enable_checkpointing(10000)  # Checkpoint every 10 seconds
@@ -360,16 +363,8 @@ def create_cloudtrail_datagen_job():
     # Set table configuration for faster commits
     t_env.get_config().set("table.exec.sink.not-null-enforcer", "drop")
     t_env.get_config().set("execution.checkpointing.interval", "10s")
-    # Use filesystem checkpoint storage to handle larger state (Iceberg buffers data files)
     t_env.get_config().set("state.checkpoint-storage", "filesystem")
-    t_env.get_config().set("state.checkpoints.dir", f"file://{flink_home}/checkpoints")
-    
-    # Set pipeline JAR configuration - find Iceberg runtime JAR (version may vary)
-    import glob
-    lib_dir = os.path.join(flink_home, "lib")
-    iceberg_jars = glob.glob(os.path.join(lib_dir, "iceberg-flink-runtime-1.20-*.jar"))
-    if iceberg_jars:
-        t_env.get_config().set("pipeline.jars", f"file://{iceberg_jars[0]}")
+    t_env.get_config().set("state.checkpoints.dir", checkpoint_uri())
     
     # Register UDF for generating CloudTrail events
     t_env.create_temporary_system_function(

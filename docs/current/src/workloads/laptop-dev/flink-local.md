@@ -74,9 +74,13 @@ env.get_checkpoint_config().set_checkpoint_storage_dir(
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `FLINK_HOME` | Auto-detected | Flink installation path |
+| `FLINK_HOME` | repo-relative dist via `scripts/flink-env.sh` | Flink installation path — never a host-absolute default |
+| `FLINK_CONF_DIR` | `$DEVENV_STATE/flink/conf` | Runtime overlay (python.executable). Keep this out of Maven `target/` |
+| `FLINK_STATE_DIR` | `$DEVENV_STATE/flink` | Checkpoints / tmp — not under the dist |
 | `ICEBERG_CATALOG_URI` | `postgresql://...` | Catalog connection |
 | `S3_ENDPOINT` | `http://localhost:9010` | MinIO endpoint |
+
+Submit scripts (`submit_iceberg_job.sh`) and PyFlink jobs resolve these through `scripts/flink-env.sh` / `cybersec.flink_paths`. Do not set `pipeline.jars=file:///abs/path` — put connectors in `$FLINK_HOME/lib/` instead.
 
 ## Related Scenarios
 

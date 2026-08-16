@@ -15,7 +15,10 @@
   env.S3_ENDPOINT = "http://localhost:9010";
 
   # Flink home - built from source in thirdparty/flink
+  # FLINK_CONF_DIR is the runtime overlay (python.executable, etc.). Keep it out of
+  # the Maven target/ dist so that tree stays relocatable across checkouts.
   env.FLINK_HOME = "${config.devenv.root}/thirdparty/flink/flink-dist/target/flink-1.20.1-bin/flink-1.20.1";
+  env.FLINK_CONF_DIR = "${config.devenv.root}/.devenv/state/flink/conf";
   env.KUBECONFIG = "${config.devenv.root}/.devenv/state/kubeconfig";
 
   # AWS S3 bucket for OTEL data - populated by `devenv tasks run aws:env` from tofu output
@@ -4775,6 +4778,15 @@ except Exception as e:
           fi
         done
 
+        # Seed a relocatable conf overlay. Host-specific keys (python.executable)
+        # belong here, never in thirdparty/flink/.../target/.../conf/.
+        FLINK_CONF_DIR="''${FLINK_CONF_DIR:-$DEVENV_STATE/flink/conf}"
+        mkdir -p "$FLINK_CONF_DIR"
+        if [ ! -f "$FLINK_CONF_DIR/config.yaml" ] && [ -f "$FLINK_DIST/conf/config.yaml" ]; then
+          cp -a "$FLINK_DIST/conf/." "$FLINK_CONF_DIR/"
+          echo "Seeded FLINK_CONF_DIR=$FLINK_CONF_DIR from dist (portable overlay)"
+        fi
+
         echo "Flink bootstrap complete"
         exit 0
       '';
@@ -4818,10 +4830,11 @@ except Exception as e:
     flink-jobmanager = {
       exec = ''
         # Use custom-built Apache Flink 1.20.1 (for Iceberg compatibility)
-        export FLINK_HOME="$PWD/thirdparty/flink/flink-dist/target/flink-1.20.1-bin/flink-1.20.1"
-        export FLINK_STATE_DIR="$DEVENV_STATE/flink"
-        export HADOOP_CONF_DIR="$FLINK_HOME/conf"
-        mkdir -p "$FLINK_STATE_DIR"/{logs,checkpoints,savepoints}
+        export FLINK_HOME="''${FLINK_HOME:-$PWD/thirdparty/flink/flink-dist/target/flink-1.20.1-bin/flink-1.20.1}"
+        export FLINK_STATE_DIR="''${FLINK_STATE_DIR:-$DEVENV_STATE/flink}"
+        export FLINK_CONF_DIR="''${FLINK_CONF_DIR:-$DEVENV_STATE/flink/conf}"
+        export HADOOP_CONF_DIR="''${HADOOP_CONF_DIR:-$FLINK_CONF_DIR}"
+        mkdir -p "$FLINK_STATE_DIR"/{logs,checkpoints,savepoints} "$FLINK_CONF_DIR"
 
         # Verify Flink exists
         if [ ! -x "$FLINK_HOME/bin/jobmanager.sh" ]; then
@@ -4866,12 +4879,13 @@ except Exception as e:
     flink-taskmanager = {
       exec = ''
         # Use custom-built Apache Flink 1.20.1 (for Iceberg compatibility)
-        export FLINK_HOME="$PWD/thirdparty/flink/flink-dist/target/flink-1.20.1-bin/flink-1.20.1"
-        export FLINK_STATE_DIR="$DEVENV_STATE/flink"
-        mkdir -p "$FLINK_STATE_DIR"/{logs,tmp}
-        
+        export FLINK_HOME="''${FLINK_HOME:-$PWD/thirdparty/flink/flink-dist/target/flink-1.20.1-bin/flink-1.20.1}"
+        export FLINK_STATE_DIR="''${FLINK_STATE_DIR:-$DEVENV_STATE/flink}"
+        export FLINK_CONF_DIR="''${FLINK_CONF_DIR:-$DEVENV_STATE/flink/conf}"
+        mkdir -p "$FLINK_STATE_DIR"/{logs,tmp} "$FLINK_CONF_DIR"
+
         # Configure S3A for MinIO
-        export HADOOP_CONF_DIR="$FLINK_HOME/conf"
+        export HADOOP_CONF_DIR="''${HADOOP_CONF_DIR:-$FLINK_CONF_DIR}"
         
         # Add comprehensive Java module opens for checkpoint serialization
         export FLINK_ENV_JAVA_OPTS="--add-opens java.base/java.util=ALL-UNNAMED --add-opens java.base/java.lang=ALL-UNNAMED --add-opens java.base/java.io=ALL-UNNAMED --add-opens java.base/java.lang.reflect=ALL-UNNAMED --add-opens java.base/java.text=ALL-UNNAMED --add-opens java.base/java.nio=ALL-UNNAMED --add-opens java.base/java.net=ALL-UNNAMED --add-opens java.base/java.util.concurrent=ALL-UNNAMED --add-opens java.base/java.util.concurrent.atomic=ALL-UNNAMED --add-opens java.base/sun.nio.ch=ALL-UNNAMED --add-opens java.base/sun.security.action=ALL-UNNAMED"
@@ -4978,9 +4992,11 @@ except Exception as e:
       exec = ''
         echo "Starting CloudTrail DataGen job..."
 
-        # Set Flink paths
-        export FLINK_HOME="$PWD/thirdparty/flink/flink-dist/target/flink-1.20.1-bin/flink-1.20.1"
+        # Set Flink paths (repo-relative; FLINK_HOME may already be set by devenv)
+        export FLINK_HOME="''${FLINK_HOME:-$PWD/thirdparty/flink/flink-dist/target/flink-1.20.1-bin/flink-1.20.1}"
+        export FLINK_STATE_DIR="''${FLINK_STATE_DIR:-$DEVENV_STATE/flink}"
         FLINK_BIN="$FLINK_HOME/bin/flink"
+        mkdir -p "$FLINK_STATE_DIR/checkpoints"
 
         # Use uv venv Python which has PyFlink installed
         if [ -f "$PWD/.devenv/state/venv/bin/python3" ]; then
@@ -5047,9 +5063,10 @@ except Exception as e:
         echo "Starting Java CloudTrail DataGen job..."
 
         # Set Flink paths
-        export FLINK_HOME="$PWD/thirdparty/flink/flink-dist/target/flink-1.20.1-bin/flink-1.20.1"
+        export FLINK_HOME="''${FLINK_HOME:-$PWD/thirdparty/flink/flink-dist/target/flink-1.20.1-bin/flink-1.20.1}"
+        export FLINK_CONF_DIR="''${FLINK_CONF_DIR:-$DEVENV_STATE/flink/conf}"
         FLINK_BIN="$FLINK_HOME/bin/flink"
-        JAR="$PWD/flink-cyber/flink-common/target/flink-common-2.4.0.jar"
+        JAR="''${FLINK_COMMON_JAR:-$PWD/flink-cyber/flink-common/target/flink-common-2.4.0.jar}"
 
         # Configurable rows per second (default 100 for benchmarking)
         RPS="''${JAVA_DATAGEN_RPS:-100}"
@@ -5119,9 +5136,10 @@ except Exception as e:
         echo "Starting Java CloudTrail Iceberg Maintenance job..."
 
         # Set Flink paths
-        export FLINK_HOME="$PWD/thirdparty/flink/flink-dist/target/flink-1.20.1-bin/flink-1.20.1"
+        export FLINK_HOME="''${FLINK_HOME:-$PWD/thirdparty/flink/flink-dist/target/flink-1.20.1-bin/flink-1.20.1}"
+        export FLINK_CONF_DIR="''${FLINK_CONF_DIR:-$DEVENV_STATE/flink/conf}"
         FLINK_BIN="$FLINK_HOME/bin/flink"
-        JAR="$PWD/flink-cyber/flink-common/target/flink-common-2.4.0.jar"
+        JAR="''${FLINK_COMMON_JAR:-$PWD/flink-cyber/flink-common/target/flink-common-2.4.0.jar}"
 
         export FLINK_ENV_JAVA_OPTS="--add-opens java.base/java.util=ALL-UNNAMED --add-opens java.base/java.lang=ALL-UNNAMED --add-opens java.base/java.io=ALL-UNNAMED --add-opens java.base/java.lang.reflect=ALL-UNNAMED --add-opens java.base/java.text=ALL-UNNAMED --add-opens java.base/java.nio=ALL-UNNAMED --add-opens java.base/java.net=ALL-UNNAMED --add-opens java.base/java.util.concurrent=ALL-UNNAMED --add-opens java.base/java.util.concurrent.atomic=ALL-UNNAMED --add-opens java.base/sun.nio.ch=ALL-UNNAMED --add-opens java.base/sun.security.action=ALL-UNNAMED"
 

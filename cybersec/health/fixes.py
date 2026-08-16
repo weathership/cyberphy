@@ -264,12 +264,24 @@ async def _fix_python_path_mismatch(
         result["message"] = "FLINK_HOME not found - cannot update config"
         return result
 
-    # Flink 1.20+ uses config.yaml
-    flink_conf_path = flink_home / "conf" / "config.yaml"
+    # Write host-specific python.executable into the runtime overlay
+    # (FLINK_CONF_DIR), never into the Maven dist under thirdparty/flink.
+    from cybersec.flink_paths import flink_conf_dir
+
+    overlay_dir = flink_conf_dir(flink_home)
+    flink_conf_path = overlay_dir / "config.yaml"
+    stock_conf = flink_home / "conf" / "config.yaml"
     if not flink_conf_path.exists():
-        result["success"] = False
-        result["message"] = f"config.yaml not found at {flink_conf_path}"
-        return result
+        if stock_conf.exists() and overlay_dir != stock_conf.parent:
+            if dry_run:
+                flink_conf_path = stock_conf
+            else:
+                overlay_dir.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(stock_conf, flink_conf_path)
+        else:
+            result["success"] = False
+            result["message"] = f"config.yaml not found at {flink_conf_path}"
+            return result
 
     # Determine the correct Python path - must have pyflink installed
     python_path = await _find_python_with_pyflink()

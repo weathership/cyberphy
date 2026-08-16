@@ -16,6 +16,7 @@ The test shows:
 
 import time
 import json
+import os
 import subprocess
 import sys
 import signal
@@ -85,7 +86,8 @@ class StreamingIngestionDemo:
         print("🎲 Starting Flink DataGen (continuous)...")
         
         # Create output directory
-        output_dir = Path("/Users/ryanhill/local/src/current/cldr-oss/cybersec/output/streaming")
+        repo = Path(__file__).resolve().parent
+        output_dir = Path(os.environ.get("STREAMING_OUTPUT_DIR", repo / "output" / "streaming"))
         output_dir.mkdir(parents=True, exist_ok=True)
         
         # Clear old files

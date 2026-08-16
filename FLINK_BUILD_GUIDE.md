@@ -13,11 +13,10 @@ The cybersec project is now configured to use:
 ### 1. Add Flink as Git Submodule
 
 ```bash
-cd /Users/ryanhill/local/src/current/cldr-oss/cybersec
+# From the repository root (path-independent)
 
-# Add Flink 1.20.1 as submodule
-git submodule add -b release-1.20.1 https://github.com/apache/flink.git flink
-git submodule update --init --recursive
+# Add Flink 1.20.1 as submodule (already recorded in .gitmodules as thirdparty/flink)
+git submodule update --init --recursive thirdparty/flink
 ```
 
 ### 2. Build Flink
@@ -95,8 +94,7 @@ processes = {
 # Start all services (PostgreSQL, MinIO, Flink)
 devenv up
 
-# In another terminal, submit the Iceberg job
-cd /Users/ryanhill/local/src/current/cldr-oss/cybersec
+# In another terminal, submit the Iceberg job (from the repo root)
 ./submit_iceberg_job.sh
 ```
 

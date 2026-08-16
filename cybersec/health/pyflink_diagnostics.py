@@ -325,8 +325,10 @@ async def gather_pyflink_diagnostics() -> dict[str, Any]:
                 "aws_bundle": [j.name for j in iceberg_aws_bundle_jars] if iceberg_aws_bundle_jars else "MISSING",
             }
 
-        # Flink 1.20+ uses config.yaml
-        flink_conf = flink_home / "conf" / "config.yaml"
+        # Flink 1.20+ uses config.yaml — prefer the runtime overlay
+        from cybersec.flink_paths import flink_conf_dir
+
+        flink_conf = flink_conf_dir(flink_home) / "config.yaml"
         if flink_conf.exists():
             try:
                 import yaml

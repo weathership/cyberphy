@@ -10,9 +10,9 @@ name: Build and Test
 
 on:
   push:
-    branches: [ "develop" ]
+    branches: [ "trunk", "develop" ]
   pull_request:
-    branches: [ "develop" ]
+    branches: [ "trunk", "develop" ]
 
 jobs:
   build_and_test_java:
@@ -31,10 +31,12 @@ jobs:
         run: mvn -P '!add-dependencies-for-IDEA,!full-build,!include-front-end' -B package --file flink-cyber/pom.xml
 
       # Optional: Uploads the full dependency graph to GitHub to improve the quality of Dependabot alerts this repository can receive
+      # github.workspace, never /home/runner/work/<old-repo-name>/… — the
+      # checkout path follows the current repository name (cyberphy, not cybersec).
       - name: Update dependency graph
         uses: advanced-security/maven-dependency-submission-action@v3
         with:
-          directory: /home/runner/work/cybersec/cybersec/flink-cyber
+          directory: ${{ github.workspace }}/flink-cyber
   build_and_test_angular:
     runs-on: ubuntu-latest
     steps:

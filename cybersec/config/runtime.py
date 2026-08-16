@@ -49,12 +49,11 @@ async def gather_runtime_config() -> dict[str, Any]:
         "is_linux": is_linux,
     }
 
-    # Path checks
+    # Path checks — relocatable via FLINK_HOME / DEVENV_ROOT, never a host literal
+    from cybersec.flink_paths import flink_conf_dir, flink_home as resolve_flink_home
+
     devenv_root = os.environ.get("DEVENV_ROOT", os.getcwd())
-    flink_home = os.environ.get(
-        "FLINK_HOME",
-        f"{devenv_root}/thirdparty/flink/flink-dist/target/flink-1.20.1-bin/flink-1.20.1"
-    )
+    flink_home = str(resolve_flink_home())
 
     runtime["paths"] = {
         "root": devenv_root,
@@ -87,8 +86,8 @@ async def gather_runtime_config() -> dict[str, Any]:
         "devenv_python_exists": Path(devenv_python).exists(),
     }
 
-    # Flink configuration state (Flink 1.20+ uses config.yaml)
-    flink_conf_path = Path(flink_home, "conf", "config.yaml")
+    # Flink configuration state (overlay first, then dist)
+    flink_conf_path = flink_conf_dir(Path(flink_home)) / "config.yaml"
     python_configured = False
     configured_python_path = ""
     configured_python_exists = False

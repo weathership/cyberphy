@@ -5,7 +5,8 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-FLINK_HOME="${SCRIPT_DIR}/thirdparty/flink/flink-dist/target/flink-1.20.1-bin/flink-1.20.1"
+# shellcheck source=scripts/flink-env.sh
+source "${SCRIPT_DIR}/scripts/flink-env.sh"
 
 # Colors for output
 GREEN='\033[0;32m'

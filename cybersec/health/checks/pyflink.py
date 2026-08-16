@@ -116,14 +116,15 @@ async def check_flink_python_config(ctx: HealthContext) -> CheckResult:
 
     start = time.monotonic()
 
-    # Get Flink home
+    # Get Flink home / conf overlay (FLINK_CONF_DIR, not the Maven dist)
+    from cybersec.flink_paths import flink_conf_dir, flink_home as resolve_flink_home
+
     flink_home = ctx.config.get_flink_home() if ctx.config else None
     if not flink_home:
-        devenv_root = os.environ.get("DEVENV_ROOT", os.getcwd())
-        flink_home = Path(devenv_root) / "thirdparty" / "flink" / "flink-dist" / "target" / "flink-1.20.1-bin" / "flink-1.20.1"
+        flink_home = resolve_flink_home()
 
     # Flink 1.20+ uses config.yaml
-    flink_conf = flink_home / "conf" / "config.yaml"
+    flink_conf = flink_conf_dir(flink_home) / "config.yaml"
 
     if not flink_conf.exists():
         duration = int((time.monotonic() - start) * 1000)
@@ -262,11 +263,12 @@ async def check_iceberg_jars(ctx: HealthContext) -> CheckResult:
     """
     start = time.monotonic()
 
-    # Get Flink home
+    # Get Flink home (relocatable — FLINK_HOME or repo-relative dist)
+    from cybersec.flink_paths import flink_home as resolve_flink_home
+
     flink_home = ctx.config.get_flink_home() if ctx.config else None
     if not flink_home:
-        devenv_root = os.environ.get("DEVENV_ROOT", os.getcwd())
-        flink_home = Path(devenv_root) / "thirdparty" / "flink" / "flink-dist" / "target" / "flink-1.20.1-bin" / "flink-1.20.1"
+        flink_home = resolve_flink_home()
 
     if not flink_home.exists():
         duration = int((time.monotonic() - start) * 1000)

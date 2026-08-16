@@ -53,19 +53,20 @@ jobs:
           generate_release_notes: true
           token: ${{ secrets.GITHUB_TOKEN }}
           files: |
-            flink-cyber/cyber-csd/target/cyber-csd--*
-            flink-cyber/cyber-csd/target/CYBERSEC-*
-            flink-cyber/cyber-parcel/target/CYBERSEC-*
+            flink-cyber/flink-common/target/flink-common-*.jar
+            flink-cyber/parser-chains-flink/target/parser-chains-flink-*.jar
 
       - name: Get current date
         id: date
         run: echo "CURRENT_DATE=$(date +'%Y-%m-%d')" >> $GITHUB_ENV
 
+      # Workspace-relative globs only — never /home/runner/work/<repo>/<repo>/…
+      # Cloudera parcel/CSD packaging is retired; ship Flink job JARs.
       - name: Publish artifact
         uses: actions/upload-artifact@v4
         with:
-          name: cybersec-${{ github.event_name == 'workflow_dispatch' && 'release' || 'nightly' }}-${{ env.CURRENT_DATE }}
+          name: cyberphy-${{ github.event_name == 'workflow_dispatch' && 'release' || 'nightly' }}-${{ env.CURRENT_DATE }}
           path: |
-            flink-cyber/cyber-csd/target/cyber-csd--*
-            flink-cyber/cyber-csd/target/CYBERSEC-*
-            flink-cyber/cyber-parcel/target/CYBERSEC-*
+            flink-cyber/flink-common/target/flink-common-*.jar
+            flink-cyber/parser-chains-flink/target/parser-chains-flink-*.jar
+          if-no-files-found: warn
