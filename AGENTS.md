@@ -1,10 +1,62 @@
-# CLAUDE.md
+# Agent instructions (cyberphy)
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+Project guidance for this repository. **AGENTS.md is the single agent file** —
+do not reintroduce `CLAUDE.md`.
 
-## Project Overview
+**Cyberphy** is a cyber-physical systems observability and analytics platform:
+OpenTelemetry from the plant floor and the platform itself, through Flink/NiFi,
+into an Iceberg lakehouse (Polaris + S3), with air-gap delivery via Zarf.
 
-Cybersec Toolkit is a data pipeline for ingesting, correlating, and preparing cybersecurity data for analytics. It builds a Security Data Lakehouse using Apache Flink, Apache Iceberg, and PostgreSQL with a focus on CloudTrail event processing.
+Import path remains `cybersec.*`. CLI `cybersec` / `cybersec-mcp` still work
+(rebrand to `cyberphy` is incremental). Zarf package/image remains
+`cybersec-dask` until a dedicated rename. Remote:
+[weathership/cyberphy](https://github.com/weathership/cyberphy).
+
+---
+
+## Portable Flink artifacts — HARD RULE
+
+**Never bake host-specific filesystem paths into Flink artifacts, job graphs, or submitters.**
+
+The Flink distribution is relocatable (`bin/config.sh` derives `FLINK_HOME` from
+the script location). This checkout must stay that way when the tree moves
+(e.g. `~/local/src/cldr/cybersec` → `~/local/src/wxs/cyberphy`).
+
+When editing Flink submitters, CI, or job graphs (`flink_jobs/`,
+`submit_iceberg*.sh`, `.github/workflows/`, `devenv.nix` Flink processes):
+
+| OK | Forbidden |
+|----|-----------|
+| `$FLINK_HOME` / `${{ github.workspace }}` / repo-relative `thirdparty/flink/…` | `/home/runner/work/cybersec/cybersec/…`, `/__w/flink/flink` |
+| `scripts/flink-env.sh`, `cybersec.flink_paths` | `/Users/<you>/…`, `/home/<you>/local/src/…` |
+| Connector JARs in `$FLINK_HOME/lib/` | `pipeline.jars=file:///abs/path/….jar` |
+| Checkpoints in `$FLINK_STATE_DIR` or `s3://…` | Checkpoints under the Maven `target/` dist |
+| Host keys (`python.executable`) in `$FLINK_CONF_DIR` (`$DEVENV_STATE/flink/conf`) | Writing those keys into `thirdparty/flink/…/target/…/conf/` |
+| nixpkgs `pkgs.flink` via devenv | A `/nix/store/<hash>-flink-…` default in a script |
+
+Guards: `uv run pytest tests/test_flink_portable_paths.py tests/test_flink_paths.py`
+
+## Portable paths (air-gap converge) — HARD RULE
+
+**Never encode site-specific filesystem layouts into converge code.**
+
+Field nodes use different mounts, homes, and directory names. Paths observed on
+one host (`/mnt/…`, `/home/<user>/…`, hostnames) are **not portable**.
+
+When editing **converge** (`zarf/scripts/converge*.sh`, `zarf/converge/`):
+
+| OK | Forbidden |
+|----|-----------|
+| argv2 / `--package` path the operator passes | Hardcoded `/mnt/…`, site trees, hostnames |
+| Package next to `converge-node.sh` or in **CWD** | `/home/<user>/…` for package or creds |
+| Optional `/var/tmp` staging | mtime walks across foreign mounts inventing a kit |
+
+Credentials stay **on the operator’s node only**. Do not invent remote home
+paths for `CONVERGE_CREDS_FILE` or paste secret material into commits/docs.
+
+Guard: `uv run pytest tests/test_converge_portable_paths.py`
+
+---
 
 ## Build Commands
 
@@ -13,6 +65,7 @@ Cybersec Toolkit is a data pipeline for ingesting, correlating, and preparing cy
 cd flink-cyber
 mvn clean install              # Build with tests
 mvn clean install -DskipTests  # Build without tests
+# cyber-parcel / cyber-csd removed from the reactor — not built
 ```
 
 ### Python
@@ -21,6 +74,9 @@ uv sync                        # Install dependencies
 uv run pytest                  # Run tests
 uv run python <script.py>      # Run Python scripts
 ```
+
+`uv sync` needs `thirdparty/flink/flink-python` (editable apache-flink).
+Initialize that submodule when disk allows; path-only work does not require it.
 
 ## Development Environment
 
@@ -112,7 +168,7 @@ The Java pipeline (`CloudTrailDataGenIcebergJob`) is the default for benchmarkin
 PyFlink DataGen → Iceberg Table → Polaris REST Catalog → MinIO S3
 ```
 
-The Python pipeline (`flink_jobs/cloudtrail_datagen.py`) generates synthetic CloudTrail events and writes directly to Iceberg at 10 rows/sec. It is independent from the Java pipeline - both can run simultaneously.
+The Python pipeline (`flink_jobs/cloudtrail_datagen.py`) generates synthetic CloudTrail events and writes directly to Iceberg at 10 rows/sec. It is independent from the Java pipeline — both can run simultaneously.
 
 To enable: set `disabled = false` on `cloudtrail-datagen` in devenv.nix.
 
@@ -132,10 +188,9 @@ To enable: set `disabled = false` on `cloudtrail-datagen` in devenv.nix.
 - `flink-indexing/` - Iceberg/Hive indexing
 - `flink-profiler-java/` - Event profiling
 - `flink-alert-scoring/` - Alert scoring system
-- `cyber-jobs/` - Pre-built Flink job configurations
-- `cyber-parcel/` & `cyber-csd/` - Cloudera Manager packaging
+- `cyber-jobs/` - Pre-built Flink job configurations (parcel/CSD packaging is retired)
 
-### Infrastructure (`devenv.nix`)
+**Infrastructure** (`devenv.nix`):
 - PostgreSQL 16 with pg_cron and Apache AGE extensions
 - MinIO for S3-compatible object storage
 - Apache Polaris REST catalog for Iceberg
@@ -175,7 +230,7 @@ This applies to:
 - **AIOps automation** (rete rules, heuristics): Submodule-aware detection and remediation
 - **Bootstrap system**: Initialize and build submodules automatically
 
-### Submodule Layout
+Do **not** initialize or build submodules on a disk-constrained checkout unless the operator asks. Recorded gitlinks:
 
 | Component | Submodule Path | Build Tool |
 |-----------|----------------|------------|
@@ -184,14 +239,10 @@ This applies to:
 | Iceberg | `thirdparty/iceberg` | Gradle (`gradlew shadowJar`) |
 | NiFi | `thirdparty/nifi` | Maven (`mvn install -DskipTests`) |
 | Polaris | `thirdparty/polaris` | Gradle (`gradlew assemble`) |
+| cdpcli | `thirdparty/cdpcli` | (legacy CDP CLI) |
 
-### Benefits
-1. **Reproducible builds** tied to git commits
-2. **Consistent versions** across developer machines
-3. **Patch capability** for customizations
-4. **No external downloads** during development
+Benefits: reproducible builds tied to git commits, consistent versions, patch capability, no external downloads during development.
 
-### Implementation Notes
 When implementing new health checks, fixes, or automation:
 - Check for submodule initialization (`pom.xml`, `build.gradle`, `setup.py`)
 - Build from source before falling back to alternatives
@@ -212,6 +263,7 @@ When implementing new health checks, fixes, or automation:
 - `ICEBERG_WAREHOUSE`: S3 path (default: `s3://cybersec/iceberg/warehouse`)
 - `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`: MinIO credentials (minioadmin/minioadmin)
 - `S3_ENDPOINT`: MinIO endpoint (http://localhost:9010)
+- `FLINK_HOME` / `FLINK_CONF_DIR` / `FLINK_STATE_DIR`: see Portable Flink artifacts
 
 ## Testing
 
@@ -248,7 +300,7 @@ On `devenv up`, the bootstrap-check process runs automatically and displays envi
 
 1. **Web UI**: Visit http://localhost:5050/settings and click "Run Bootstrap"
 2. **CLI**: Run `cybersec bootstrap run` or `uv run python -m cybersec.cli.main bootstrap run`
-3. **MCP**: Use the `bootstrap_run` tool from Claude Code or other MCP clients
+3. **MCP**: Use the `bootstrap_run` tool
 
 ### Bootstrap CLI Commands
 
@@ -308,8 +360,6 @@ warehouse = "s3://cybersec/iceberg/warehouse"
 
 ### MCP Server for AI Agents
 
-Start the MCP server for Claude Code integration:
-
 ```bash
 cybersec-mcp
 # Or: uv run python -m cybersec.mcp.server
@@ -327,20 +377,15 @@ Available MCP tools:
 
 ```
 cybersec/
-├── __init__.py
 ├── bootstrap/           # Core bootstrap library
-│   ├── __init__.py
 │   ├── config.py       # BootstrapConfig, SettingsManager
 │   ├── state.py        # BootstrapState, TaskResult, TaskStatus
 │   ├── events.py       # EventEmitter, EventType, BootstrapEvent
 │   └── service.py      # BootstrapService (main orchestrator)
 ├── cli/                 # Typer CLI interface
-│   ├── __init__.py
-│   ├── main.py         # Main CLI app
-│   └── bootstrap.py    # Bootstrap subcommands
+│   └── main.py
 └── mcp/                 # MCP server (fastmcp)
-    ├── __init__.py
-    └── server.py       # MCP tools and resources
+    └── server.py
 ```
 
 ### Web UI Routes
@@ -413,7 +458,7 @@ The health system provides FMEA-based diagnostics and automated remediation.
 
 Provider-agnostic naming for swappable components:
 - `flink` - Flink and PyFlink issues
-- `nifi`, `kafka` - Future Cloudera OSS components
+- `nifi`, `kafka` - Future stream/flow components
 - `rest-catalog` - REST catalog (Polaris)
 - `local-s3` - Local S3 storage (MinIO)
 - `aws-s3` - AWS S3 (future)
@@ -449,7 +494,7 @@ The Operations Agent (`@ops`) provides automated environment validation, service
 Flink must be built or configured for complete E2E functionality:
 
 ```bash
-# Option A: Build from source (recommended)
+# Option A: Build from source (recommended) — only when disk allows
 cd thirdparty/flink
 git submodule update --init --recursive
 mvn clean install -DskipTests -Dfast
@@ -503,10 +548,3 @@ curl http://localhost:8889/metrics | head
 # Query Prometheus
 curl 'http://localhost:9090/api/v1/query?query=up'
 ```
-
-### Future Enhancements
-
-The ops agent will be extended with:
-- **Conftest**: Infrastructure policy validation, security baselines
-- **Grafana**: Metrics visualization dashboards
-- **Alerting**: Threshold-based notifications
