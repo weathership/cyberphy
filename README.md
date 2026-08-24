@@ -131,7 +131,7 @@ devenv up
 zarf/           # ★ Zarf releases, converge, air-gap runbooks  (primary deliverable)
 infra/          # ★ OpenTofu AWS + Ansible RKE2 / stack deploy
 flink-cyber/    # Flink pipelines (parse, enrich, index, profile) — no CM parcel/CSD
-thirdparty/     # flink, iceberg, nifi, polaris submodules (source builds)
+thirdparty/     # flink/iceberg/nifi/polaris gitlinks (HTTPS); flink-python vendored PyFlink
 cybersec/       # Python ops + engine (name to be aligned with cyberphy over time)
 docs/           # Deeper ops / architecture notes
 ```

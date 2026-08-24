@@ -21,16 +21,14 @@ async def check_pyflink_installed(ctx: HealthContext) -> CheckResult:
     """PYFLINK_001: Check PyFlink is installed and accessible.
 
     Checks if any Python in the environment has pyflink installed.
-    PyFlink should be installed from thirdparty/flink/flink-python submodule
-    as an editable install via uv sync.
+    PyFlink is an editable install of vendored thirdparty/flink-python via uv sync.
     """
     start = time.monotonic()
 
     devenv_root = os.environ.get("DEVENV_ROOT", os.getcwd())
 
-    # First check if the Flink submodule is set up for PyFlink
-    flink_python_dir = Path(devenv_root) / "thirdparty" / "flink" / "flink-python"
-    flink_submodule_ready = (flink_python_dir / "setup.py").exists()
+    flink_python_dir = Path(devenv_root) / "thirdparty" / "flink-python"
+    flink_python_ready = (flink_python_dir / "setup.py").exists()
 
     # Check candidate Python paths in order of preference
     candidates = [
@@ -77,7 +75,7 @@ async def check_pyflink_installed(ctx: HealthContext) -> CheckResult:
             version=version,
             python=python_path,
             location=name,
-            source="thirdparty/flink/flink-python" if flink_submodule_ready else "unknown",
+            source="thirdparty/flink-python" if flink_python_ready else "unknown",
         )
         result_obj.duration_ms = duration
         return result_obj
@@ -85,15 +83,13 @@ async def check_pyflink_installed(ctx: HealthContext) -> CheckResult:
         fm = get_failure_mode("PYFLINK_001")
         rpn = fm.calculate_rpn() if fm else None
 
-        # Provide specific remediation based on submodule state
-        if not flink_submodule_ready:
+        if not flink_python_ready:
             remediation = (
-                "Initialize Flink submodule first:\n"
-                "  git submodule update --init thirdparty/flink\n"
-                "Then run: uv sync"
+                "Vendored PyFlink tree is missing (thirdparty/flink-python/setup.py).\n"
+                "Restore it from git, then run: uv sync"
             )
         else:
-            remediation = "Run: /health fix PYFLINK_001 --apply (runs uv sync with submodule cleanup)"
+            remediation = "Run: /health fix PYFLINK_001 --apply (runs uv sync)"
 
         return CheckResult.critical(
             "PyFlink not installed in any Python environment",
@@ -101,7 +97,7 @@ async def check_pyflink_installed(ctx: HealthContext) -> CheckResult:
             rpn=rpn,
             remediation=remediation,
             checked_paths=[str(p) for _, p in candidates if p.exists()],
-            flink_submodule_ready=flink_submodule_ready,
+            flink_python_ready=flink_python_ready,
             flink_python_dir=str(flink_python_dir),
             duration_ms=duration,
         )
@@ -242,7 +238,11 @@ async def check_submodules(ctx: HealthContext) -> CheckResult:
             f"Git submodules not initialized: {', '.join(missing)}",
             failure_mode_id="PYFLINK_013",
             rpn=rpn,
-            remediation="Run: git submodule update --init --recursive",
+            remediation=(
+                "Needed only for a local Flink/Iceberg source build (disk-heavy): "
+                "git submodule update --init thirdparty/flink thirdparty/iceberg. "
+                "PyFlink does not require this — uv sync uses thirdparty/flink-python."
+            ),
             missing_submodules=missing,
             duration_ms=duration,
         )

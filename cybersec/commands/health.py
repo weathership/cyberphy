@@ -314,7 +314,7 @@ async def cmd_health_fix(cmd: ParsedCommand) -> CommandResult:
         "SYSTEM_001",  # Shared memory limits too low -> increase kern.sysv.*
         "INFRA_004",  # Orphaned shared memory segments -> ipcrm cleanup
         # Build/install fixes (submodule-aware)
-        "PYFLINK_001",  # PyFlink not installed -> uv sync from submodule
+        "PYFLINK_001",  # PyFlink not installed -> uv sync from thirdparty/flink-python
         "PYFLINK_011", "PYFLINK_012", "PYFLINK_014",  # Iceberg JARs -> build from submodule
         "NIFI_001",   # NiFi not installed -> build from submodule
         # Configuration fixes

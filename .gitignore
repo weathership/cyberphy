@@ -7,6 +7,8 @@
 *.auto.tfvars
 thirdparty/*
 !thirdparty/hadoop-client/
+!thirdparty/flink-python/
+!thirdparty/flink-python/**/*.txt
 .DS_Store
 .vscode
 target/

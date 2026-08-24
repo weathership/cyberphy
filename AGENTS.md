@@ -75,8 +75,10 @@ uv run pytest                  # Run tests
 uv run python <script.py>      # Run Python scripts
 ```
 
-`uv sync` needs `thirdparty/flink/flink-python` (editable apache-flink).
-Initialize that submodule when disk allows; path-only work does not require it.
+`uv sync` installs patched PyFlink from `thirdparty/flink-python` (editable
+`apache-flink`, no Java submodule required). Initialize `thirdparty/flink` only
+when you need a local Flink dist; do not do that on a disk-constrained checkout
+unless the operator asks.
 
 ## Development Environment
 
@@ -234,12 +236,12 @@ Do **not** initialize or build submodules on a disk-constrained checkout unless 
 
 | Component | Submodule Path | Build Tool |
 |-----------|----------------|------------|
-| Flink | `thirdparty/flink` | Maven (`mvn install -DskipTests -Dfast`) |
-| PyFlink | `thirdparty/flink/flink-python` | uv editable install |
-| Iceberg | `thirdparty/iceberg` | Gradle (`gradlew shadowJar`) |
-| NiFi | `thirdparty/nifi` | Maven (`mvn install -DskipTests`) |
-| Polaris | `thirdparty/polaris` | Gradle (`gradlew assemble`) |
-| cdpcli | `thirdparty/cdpcli` | (legacy CDP CLI) |
+| Flink | `thirdparty/flink` (`https://github.com/rch/asf-flink.git`) | Maven (`mvn install -DskipTests -Dfast`) |
+| PyFlink | `thirdparty/flink-python` (vendored, not a submodule) | uv editable install |
+| Iceberg | `thirdparty/iceberg` (`https://github.com/apache/iceberg.git`) | Gradle (`gradlew shadowJar`) |
+| NiFi | `thirdparty/nifi` (`https://github.com/apache/nifi.git`) | Maven (`mvn install -DskipTests`) |
+| Polaris | `thirdparty/polaris` (`https://github.com/apache/polaris.git`) | Gradle (`gradlew assemble`) |
+| cdpcli | `thirdparty/cdpcli` (`https://github.com/rch/cldr-cdpcli.git`) | (legacy CDP CLI) |
 
 Benefits: reproducible builds tied to git commits, consistent versions, patch capability, no external downloads during development.
 

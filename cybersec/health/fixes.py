@@ -36,7 +36,7 @@ All health fixes, AIOps heuristics, and self-healing automation MUST prefer
 building from thirdparty/ submodules over downloading binaries:
 
 - Flink: Build from thirdparty/flink (mvn install)
-- PyFlink: Install from thirdparty/flink/flink-python (uv sync editable)
+- PyFlink: Install from thirdparty/flink-python (uv sync editable)
 - Iceberg: Build JARs from thirdparty/iceberg (gradlew shadowJar)
 - NiFi: Build from thirdparty/nifi (mvn install)
 - Polaris: Build from thirdparty/polaris (gradlew assemble)
@@ -1260,13 +1260,14 @@ async def _fix_nifi_not_installed(dry_run: bool) -> dict[str, Any]:
 
 
 async def _fix_pyflink_not_installed(dry_run: bool) -> dict[str, Any]:
-    """Fix: Install PyFlink from thirdparty/flink/flink-python submodule.
+    """Fix: Install PyFlink from thirdparty/flink-python via uv sync.
 
-    PyFlink is installed as an editable package from the Flink submodule.
-    This fix:
-    1. Verifies the Flink submodule is initialized
+    PyFlink is an editable install of the vendored apache-flink 1.20.1 tree
+    (cloudpickle 3.x / Dask patches). This does not require the Java Flink
+    submodule. The fix:
+    1. Verifies thirdparty/flink-python/setup.py exists
     2. Cleans up any shadowing pyflink directory from apache-flink-libraries
-    3. Runs uv sync to install PyFlink from the submodule
+    3. Runs uv sync
 
     The apache-flink-libraries package can create a pyflink/ directory in
     site-packages that shadows the editable install, causing pyflink.__file__
@@ -1280,22 +1281,13 @@ async def _fix_pyflink_not_installed(dry_run: bool) -> dict[str, Any]:
     }
 
     devenv_root = os.environ.get("DEVENV_ROOT", os.getcwd())
-    flink_dir = Path(devenv_root) / "thirdparty" / "flink"
-    flink_python_dir = flink_dir / "flink-python"
+    flink_python_dir = Path(devenv_root) / "thirdparty" / "flink-python"
 
-    # Check if Flink submodule exists
-    if not flink_dir.exists():
-        result["success"] = False
-        result["message"] = f"Flink submodule not found at {flink_dir}"
-        result["command"] = "git submodule update --init thirdparty/flink"
-        return result
-
-    # Check if flink-python directory exists (submodule initialized)
     if not (flink_python_dir / "setup.py").exists():
         result["success"] = False
-        result["message"] = "Flink submodule not initialized - flink-python/setup.py not found"
-        result["command"] = "git submodule update --init --recursive thirdparty/flink"
-        result["flink_dir"] = str(flink_dir)
+        result["message"] = "Vendored PyFlink tree missing - thirdparty/flink-python/setup.py not found"
+        result["command"] = "git checkout -- thirdparty/flink-python"
+        result["flink_python_dir"] = str(flink_python_dir)
         return result
 
     result["flink_python_dir"] = str(flink_python_dir)
@@ -1320,8 +1312,8 @@ async def _fix_pyflink_not_installed(dry_run: bool) -> dict[str, Any]:
         steps = []
         if shadow_exists:
             steps.append(f"Remove shadowing directory: {shadowing_pyflink}")
-        steps.append("Run: uv sync (installs PyFlink from thirdparty/flink/flink-python)")
-        result["message"] = "Would install PyFlink from Flink submodule"
+        steps.append("Run: uv sync (installs PyFlink from thirdparty/flink-python)")
+        result["message"] = "Would install PyFlink from vendored thirdparty/flink-python"
         result["steps"] = steps
         return result
 
@@ -1358,7 +1350,9 @@ async def _fix_pyflink_not_installed(dry_run: bool) -> dict[str, Any]:
 
             if verify_proc.returncode == 0:
                 result["success"] = True
-                result["message"] = f"Installed PyFlink {verify_proc.stdout.strip()} from submodule"
+                result["message"] = (
+                    f"Installed PyFlink {verify_proc.stdout.strip()} from thirdparty/flink-python"
+                )
                 result["pyflink_version"] = verify_proc.stdout.strip()
             else:
                 result["success"] = False
@@ -1367,7 +1361,7 @@ async def _fix_pyflink_not_installed(dry_run: bool) -> dict[str, Any]:
         else:
             # Can't verify but uv sync succeeded
             result["success"] = True
-            result["message"] = "Installed PyFlink from submodule (unable to verify)"
+            result["message"] = "Installed PyFlink from thirdparty/flink-python (unable to verify)"
 
     except subprocess.TimeoutExpired:
         result["success"] = False

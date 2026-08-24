@@ -1,0 +1,1 @@
+This file is used to force setuptools to include the log directory. You can delete it at any time after installation.

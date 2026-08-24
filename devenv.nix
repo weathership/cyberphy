@@ -142,7 +142,7 @@
 
     # Fix PyFlink editable install: remove conflicting pyflink directory from site-packages
     # The apache-flink-libraries package installs a pyflink/ dir with bin/lib/opt that shadows
-    # the editable install from thirdparty/flink/flink-python. This causes pyflink.__file__ = None.
+    # the editable install from thirdparty/flink-python. This causes pyflink.__file__ = None.
     PYFLINK_SITEPACKAGES="$DEVENV_STATE/venv/lib/python3.12/site-packages/pyflink"
     if [ -d "$PYFLINK_SITEPACKAGES" ] && [ -f "$PYFLINK_SITEPACKAGES/README.txt" ]; then
       rm -rf "$PYFLINK_SITEPACKAGES"
@@ -165,14 +165,14 @@
       fi
     fi
 
-    # Auto-prepare submodules (init only, no branch checkout)
-    # This runs quickly and ensures submodules are initialized on direnv allow
-    if [ -f "cybersec/bootstrap/submodules.py" ]; then
+    # Do not auto-init Java/NiFi/Polaris submodules on shell enter — those trees
+    # are multiple GB. PyFlink comes from vendored thirdparty/flink-python.
+    # Operator opt-in: CYBERPHY_INIT_SUBMODULES=1 direnv reload
+    if [ "''${CYBERPHY_INIT_SUBMODULES:-}" = "1" ] && [ -f "cybersec/bootstrap/submodules.py" ]; then
       uv run python -c "
 from cybersec.bootstrap.submodules import prepare_all_submodules, is_submodule_initialized
 import sys
 
-# Check if any submodule needs initialization
 needs_init = []
 for name in ['flink', 'polaris', 'iceberg']:
     if not is_submodule_initialized(name):

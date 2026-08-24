@@ -6,13 +6,18 @@ Running Flink jobs locally for development and testing.
 
 ### Option A: Build from Source (Recommended)
 
+PyFlink (`uv sync`) does **not** need this. It uses vendored
+`thirdparty/flink-python`. Only initialize the Java Flink submodule when you
+need a local JobManager/dist — it is multiple GB.
+
 ```bash
+git submodule update --init thirdparty/flink
 cd thirdparty/flink
-git submodule update --init --recursive
 mvn clean install -DskipTests -Dfast
 ```
 
-This builds Flink 1.20.1 with Iceberg 1.9.0 compatibility.
+This builds Flink 1.20.1 with Iceberg 1.9.0 compatibility. Submodule URL is
+`https://github.com/rch/asf-flink.git` (HTTPS, no SSH key required).
 
 ### Option B: Use Existing Installation
 

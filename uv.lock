@@ -280,7 +280,7 @@ wheels = [
 [[package]]
 name = "apache-flink"
 version = "1.20.1"
-source = { editable = "thirdparty/flink/flink-python" }
+source = { editable = "thirdparty/flink-python" }
 dependencies = [
     { name = "apache-beam" },
     { name = "apache-flink-libraries" },
@@ -752,7 +752,7 @@ observability = [
 requires-dist = [
     { name = "ansible", specifier = ">=13.3.0" },
     { name = "ansible-navigator", specifier = ">=26.1.2" },
-    { name = "apache-flink", editable = "thirdparty/flink/flink-python" },
+    { name = "apache-flink", editable = "thirdparty/flink-python" },
     { name = "black", marker = "extra == 'dev'", specifier = ">=24.0.0" },
     { name = "bokeh", marker = "extra == 'observability'", specifier = ">=3.3.0" },
     { name = "boto3", specifier = ">=1.34.0" },

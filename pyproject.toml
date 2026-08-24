@@ -32,8 +32,9 @@ dependencies = [
     "ansible>=13.3.0",
     "ansible-navigator>=26.1.2",
     "python-snappy>=0.7.3",
-    # PyFlink - uses patched thirdparty/flink for cloudpickle 3.x compatibility.
-    # See tool.uv.sources below for local path override.
+    # PyFlink - patched 1.20.1 (cloudpickle 3.x / Dask + avro 1.12). See
+    # tool.uv.sources: vendored at thirdparty/flink-python so `uv sync` does
+    # not require the 5+ GB thirdparty/flink Java submodule.
     "apache-flink>=1.20.0",
     "h5py>=3.16.0",
 ]
@@ -117,10 +118,10 @@ include = ["cybersec*"]
 [tool.uv]
 package = true
 
-# Override apache-flink to use patched submodule with cloudpickle 3.x compatibility.
-# The submodule (thirdparty/flink) is patched to use:
-#   - apache-beam>=2.71.0 (which dropped cloudpickle dependency)
-#   - cloudpickle>=3.0.0 (compatible with Dask)
-# This resolves the cloudpickle version conflict between Flink and Dask.
+# Override apache-flink with the patched 1.20.1 tree (cloudpickle 3.x / Dask,
+# avro 1.12, Python 3.12 bounds). This is the PyPI sdist plus the same delta
+# as rch/asf-flink@rch/devenv-cybersec — kept as a regular tree so a clone can
+# `uv sync` without initializing thirdparty/flink.
+# See thirdparty/flink-python/PATCHES.md.
 [tool.uv.sources]
-apache-flink = { path = "thirdparty/flink/flink-python", editable = true }
+apache-flink = { path = "thirdparty/flink-python", editable = true }

@@ -145,7 +145,7 @@ PYFLINK_001 = FailureMode(
     cause="apache-flink package not installed in Python environment",
     detection_method="import pyflink succeeds",
     remediation_steps=[
-        "Install PyFlink: uv pip install apache-flink",
+        "Install PyFlink: uv sync  # editable from thirdparty/flink-python",
         "Verify installation: python -c 'import pyflink; print(pyflink.__version__)'",
         "Ensure using correct Python environment (devenv venv)",
     ],
@@ -390,7 +390,9 @@ PYFLINK_013 = FailureMode(
     cause="Repository cloned without --recursive or submodule update not run",
     detection_method="Check for thirdparty/iceberg/gradlew or thirdparty/flink/pom.xml",
     remediation_steps=[
-        "Initialize submodules: git submodule update --init --recursive",
+        "Only when a local Flink/Iceberg *source* build is needed (disk-heavy):",
+        "  git submodule update --init thirdparty/flink thirdparty/iceberg",
+        "PyFlink itself does not require those submodules — `uv sync` uses thirdparty/flink-python.",
         "Then run bootstrap: devenv tasks run restart:clean",
     ],
     observation_level=AutomationLevel.A,
