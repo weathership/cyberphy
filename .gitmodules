@@ -15,5 +15,5 @@
 	url = https://github.com/rch/cldr-cdpcli.git
 [submodule "external/nautilus"]
 	path = external/nautilus
-	url = git@github.com:weathership/nautilus.git
+	url = https://github.com/weathership/nautilus.git
 	branch = trunk
