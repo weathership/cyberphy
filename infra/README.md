@@ -141,7 +141,7 @@ Use for production or team-accessible deployments on AWS.
 |---------|------|-----|
 | Flink UI | 8081 | http://localhost:8081 |
 | Polaris REST | 8181 | http://localhost:8181 |
-| MinIO Console | 9011 | http://localhost:9011 |
+| RustFS (local S3) Console | 9011 | http://localhost:9011 |
 | PostgreSQL | 5438 | (internal) |
 | Prometheus | 9090 | http://localhost:9090 |
 | NiFi | 8450 | http://localhost:8450 |

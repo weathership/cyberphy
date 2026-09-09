@@ -89,7 +89,7 @@ CATALOG_CONFIG = {
     "s3.access-key-id": "minioadmin",
     "s3.secret-access-key": "minioadmin",
     "s3.path-style-access": "true",
-    "warehouse": "s3://cybersec/iceberg/warehouse",
+    "warehouse": "s3://cyberphy/iceberg/warehouse",
 }
 ```
 

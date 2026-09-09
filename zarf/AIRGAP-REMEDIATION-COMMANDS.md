@@ -378,16 +378,31 @@ Clean up the exported secrets when done: `unset ZARF_VAR_S3_ACCESS_KEY ZARF_VAR_
 
 ---
 
-## T4.workers-capacity — workers oversubscribed (`Pending`)
-Strands `otel-navigator` (no node fits its memory). Set the DaskCluster source-of-truth replicas to
-fit, then **reap excess/orphaned worker Deployments** (the operator may leave them). Target =
-schedulable nodes − 1 (leaves headroom for panel-viz/engine/jupyter), min 1.
+## T4.workers-capacity — workers oversubscribed / sizing drift (engine ≥ 0.5.0)
+Strands `otel-navigator` when workers oversubscribe node memory. Engine does **surgical**
+remediation (no zarf re-push):
+
+1. Fold aliases: `DASK_WORKER_MEM_LIMIT` → `DASK_WORKER_MEMORY`, optional `MEM_REQUEST`
+2. Target replicas = `min(DASK_WORKER_REPLICAS, floor((total_alloc_Gi − 8) / worker_Gi))`, then
+   shrink further if workers are still `Pending`
+3. Merge-patch live `DaskCluster/cybersec-dask` for **replicas + nthreads + cpu + memory**
+4. Bounce worker pods when template fields change (operator often skips rolls)
+5. Reap excess/orphaned worker Deployments (least-ready first)
+
+Canonical vars (package + engine): `DASK_WORKER_REPLICAS` / `NTHREADS` / `CPU` / `MEMORY`.
 ```bash
-TARGET=$(( $(kc get nodes -o json | python3 -c 'import sys,json;print(sum(1 for n in json.load(sys.stdin)["items"] if {c["type"]:c["status"] for c in n["status"]["conditions"]}.get("Ready")=="True"))') - 1 )); [ "$TARGET" -lt 1 ] && TARGET=1; echo "TARGET=$TARGET"
-kc patch daskcluster cybersec-dask -n dask --type merge -p "{\"spec\":{\"worker\":{\"replicas\":$TARGET}}}"   # engine: _rem_workers_capacity
-# reap excess worker Deployments, Pending/least-ready first:
-kc -n dask get deploy -l dask.org/component=worker
-kc -n dask get deploy -l dask.org/component=worker --sort-by=.status.readyReplicas -o name | head -n -$TARGET | xargs -r -n1 kc -n dask delete --wait=false
+export DASK_WORKER_REPLICAS=${DASK_WORKER_REPLICAS:-4}
+export DASK_WORKER_NTHREADS=${DASK_WORKER_NTHREADS:-2}
+export DASK_WORKER_CPU=${DASK_WORKER_CPU:-2}
+export DASK_WORKER_MEMORY=${DASK_WORKER_MEMORY:-6Gi}
+# Prefer: converge apply with the env above (engine: _rem_workers_capacity)
+# Manual replica-only cap:
+kc patch daskcluster cybersec-dask -n dask --type merge -p "{\"spec\":{\"worker\":{\"replicas\":$DASK_WORKER_REPLICAS}}}"
+# After template edits, force pickup:
+kc -n dask delete pod -l dask.org/component=worker --force --grace-period=0 --wait=false
+# Reap excess worker Deployments, Pending/least-ready first:
+kc -n dask get deploy -l dask.org/component=worker --sort-by=.status.readyReplicas -o name \
+  | head -n -$DASK_WORKER_REPLICAS | xargs -r -n1 kc -n dask delete --wait=false
 kc -n dask get pods -l dask.org/component=worker -o wide
 ```
 

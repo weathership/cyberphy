@@ -1,10 +1,19 @@
-# DaskCluster for Cybersec air-gap deployment
+# DaskCluster for Cyberphy air-gap deployment
 # Uses the custom cybersec-dask image with pre-baked Python dependencies
 #
 # Zarf template variables:
-#   ###ZARF_VAR_DASK_WORKER_REPLICAS### - Number of worker replicas
-#   ###ZARF_VAR_DASK_SPILL_DIR### - Host path for worker spill-to-disk
-#   ###ZARF_REGISTRY### - Zarf-injected registry URL (for image rewriting)
+#   ###ZARF_VAR_DASK_WORKER_REPLICAS### - Number of worker pods (scale for multi-core / 2 TiB)
+#   ###ZARF_VAR_DASK_WORKER_NTHREADS### - Threads per worker (match CPU limit)
+#   ###ZARF_VAR_DASK_WORKER_MEMORY###   - Per-worker memory limit (also --memory-limit)
+#   ###ZARF_VAR_DASK_WORKER_CPU###      - Per-worker CPU limit (should be >= nthreads)
+#   ###ZARF_VAR_DASK_SPILL_DIR###       - Host path for worker spill-to-disk
+#   ###ZARF_REGISTRY###                 - Zarf-injected registry URL (for image rewriting)
+#
+# Multi-core sizing (single fat node or multi-node air-gap):
+#   lab  ~10 GiB HDF5 :  4–8 workers × 2–4 threads
+#   2 TiB air-gap     : 16–32 workers (or node_count × 2–4), spill on fast disk/NFS
+# Prefer patching DaskCluster.spec.worker.replicas (operator source of truth)
+# over scaling the Deployment directly.
 ---
 apiVersion: kubernetes.dask.org/v1
 kind: DaskCluster
@@ -37,7 +46,8 @@ spec:
       containers:
         - name: scheduler
           # Image will be rewritten by Zarf to use internal registry
-          image: localhost:5555/cybersec-dask:2025.2.0-fbc70781a3
+          # Notebook image includes h5py/holoviews (HDF5 Dask tasks). Zarf rewrites tag.
+          image: localhost:5555/cybersec-dask:2025.2.0-74bc219d3a
           imagePullPolicy: IfNotPresent
           args:
             - dask-scheduler
@@ -58,6 +68,8 @@ spec:
           # Injected into BOTH scheduler and worker pods because dask-cluster is
           # a RAW-MANIFEST component (zarf.yaml) — no Helm chart renders these.
           env:
+            - name: PYTHONPATH
+              value: "/app"
             - name: S3_ENDPOINT
               value: "###ZARF_VAR_S3_ENDPOINT###"
             - name: AWS_REGION
@@ -93,24 +105,26 @@ spec:
       restartPolicy: Always
       containers:
         - name: worker
-          # Image will be rewritten by Zarf to use internal registry
-          image: localhost:5555/cybersec-dask:2025.2.0-fbc70781a3
+          # Same notebook image as Jupyter — workers must import h5py for HDF5 tasks
+          image: localhost:5555/cybersec-dask:2025.2.0-74bc219d3a
           imagePullPolicy: IfNotPresent
           args:
             - dask-worker
             - --nthreads
-            - "2"
+            - "###ZARF_VAR_DASK_WORKER_NTHREADS###"
             - --memory-limit
-            - 6Gi
+            - "###ZARF_VAR_DASK_WORKER_MEMORY###"
             - --local-directory
             - /dask-spill
           # See scheduler comment above — S3 creds are templated from the Zarf
           # S3_* variables (empty default => AWS IMDS fallback; set them for a
           # non-AWS / air-gap S3 gateway). Injected here too because the Dask
-          # WORKERS perform the actual parquet read/write for the viz data path.
+          # WORKERS perform the actual parquet/HDF5 read for the data path.
           env:
             - name: DASK_DASHBOARD_ADDRESS
               value: ":8787"
+            - name: PYTHONPATH
+              value: "/app"
             - name: S3_ENDPOINT
               value: "###ZARF_VAR_S3_ENDPOINT###"
             - name: AWS_REGION
@@ -126,11 +140,13 @@ spec:
               mountPath: /dask-spill
           resources:
             requests:
-              cpu: "250m"
-              memory: 4Gi
+              # Request less than limit so several workers pack onto one fat node
+              cpu: "500m"
+              memory: 2Gi
             limits:
-              cpu: "1"
-              memory: 6Gi
+              # CPU limit must be >= nthreads or the worker is artificially serial
+              cpu: "###ZARF_VAR_DASK_WORKER_CPU###"
+              memory: "###ZARF_VAR_DASK_WORKER_MEMORY###"
       volumes:
         - name: dask-spill
           hostPath:

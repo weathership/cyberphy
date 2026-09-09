@@ -37,11 +37,11 @@ class IcebergWriter:
         # Prefer MINIO_* credentials when S3_ENDPOINT is set (local MinIO)
         endpoint = os.getenv("S3_ENDPOINT", "http://localhost:9010")
         if endpoint:
-            access_key = os.getenv("MINIO_ACCESS_KEY") or os.getenv("AWS_ACCESS_KEY_ID", "minioadmin")
-            secret_key = os.getenv("MINIO_SECRET_KEY") or os.getenv("AWS_SECRET_ACCESS_KEY", "minioadmin")
+            access_key = os.getenv("MINIO_ACCESS_KEY") or os.getenv("AWS_ACCESS_KEY_ID", "admin")
+            secret_key = os.getenv("MINIO_SECRET_KEY") or os.getenv("AWS_SECRET_ACCESS_KEY", "admin")
         else:
-            access_key = os.getenv("AWS_ACCESS_KEY_ID", "minioadmin")
-            secret_key = os.getenv("AWS_SECRET_ACCESS_KEY", "minioadmin")
+            access_key = os.getenv("AWS_ACCESS_KEY_ID", "admin")
+            secret_key = os.getenv("AWS_SECRET_ACCESS_KEY", "admin")
 
         self.catalog = load_catalog(
             "cybersec",
@@ -157,7 +157,7 @@ if __name__ == "__main__":
     )
     warehouse_path = os.getenv(
         "ICEBERG_WAREHOUSE",
-        "s3://cybersec/iceberg/warehouse"
+        "s3://cyberphy/iceberg/warehouse"
     )
 
     print("Initializing Iceberg Writer...")

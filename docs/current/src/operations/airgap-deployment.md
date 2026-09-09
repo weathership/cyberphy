@@ -1,6 +1,6 @@
 # Air-Gap Deployment: OTEL Navigator + Dask
 
-Deploy the Cybersec OTEL Navigator visualization stack to RKE2 clusters without internet access using [Zarf](https://zarf.dev/).
+Deploy the Cyberphy OTEL Navigator visualization stack to RKE2 clusters without internet access using [Zarf](https://zarf.dev/).
 
 ## Architecture
 
@@ -212,12 +212,12 @@ If RKE2 Traefik ingress is configured:
 
 1. Add to `/etc/hosts`:
    ```
-   <node-ip>  navigator.cybersec.local dask.cybersec.local
+   <node-ip>  navigator.cyberphy.local dask.cyberphy.local
    ```
 
 2. Access:
-   - `http://navigator.cybersec.local`
-   - `http://dask.cybersec.local`
+   - `http://navigator.cyberphy.local`
+   - `http://dask.cyberphy.local`
 
 ## Configuration
 
@@ -230,7 +230,7 @@ If RKE2 Traefik ingress is configured:
 | S3_ACCESS_KEY | (empty) | S3 access key |
 | S3_SECRET_KEY | (empty) | S3 secret key |
 | INGRESS_CLASS | traefik | Ingress controller |
-| INGRESS_DOMAIN | cybersec.local | Base domain |
+| INGRESS_DOMAIN | cyberphy.local | Base domain |
 
 ### OTEL Navigator Environment
 

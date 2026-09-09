@@ -36,20 +36,30 @@ stack (PyIceberg/Dask) support them.
 ```
 DATASET PLANE (read-only, conserved)          METADATA PLANE (local S3, rebuildable)
 ─────────────────────────────────────         ──────────────────────────────────────────────
-nfs:///data/**.h5          (posix)            s3://<metadata-bucket-or-prefix>/
+nfs:///data/**.h5          (posix)            s3://<metadata-bucket-or-prefix>/  e.g. cyberphy-md/
 s3://ro-datasets/**.h5     (object)             iceberg/warehouse/                ← the warehouse
-        │                                          telemetry/hdf5_datasets/       (pointer table)
+        │                                          telemetry/hdf5_datasets/       (Arrow pointer table)
         │  referenced by URI +                     telemetry/hdf5_chunk_stats/    (pruning stats)
         │  fingerprint, never written              telemetry/overviews_l1/ _l2/   (raster pyramids)
         └────────────────────────────►          indexes/kerchunk/<fingerprint>.json  ← byte-range refs
+                                                semantic/*.ttl                    ← DCAT/SHACL (not JSON-LD)
                                                 catalog/                          ← stepping stone state
 ```
+
+Lab generator default object keys (no Hive `key=value` path partitions):
+
+```
+s3://cyberphy/datasets/hdf5/cphy/cphy_<ISO>_<part>Z.h5
+```
+
+Time bounds and soft tags live in **file attrs + metadata tables** (Arrow / Iceberg), not directories.
+Customer air-gap layouts use **layout adapters** (`product_prefix`, `flat_prefix`, custom) for discovery only.
 
 - Access is uniformly **fsspec** (`file://` for NFS, `s3://` for object storage) — the index
   refs, the registration scan, and the Dask readers all use the same abstraction, so NFS vs
   object storage is a URI difference, not a code path.
 - Separate buckets (or prefixes with distinct policies) for the RO dataset plane vs the metadata
-  plane; in dev, two MinIO buckets model this exactly.
+  plane; in dev, two prefixes (`…/datasets/…` vs `…/cyberphy-md/…`) model this on one bucket.
 
 ## 3. Catalog: stepping stone → Polaris
 

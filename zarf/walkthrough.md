@@ -1,6 +1,6 @@
 # Air-Gap RKE2 Zarf Deployment — Step-by-Step Walkthrough
 
-> **Audience**: Operators deploying Cybersec Dask to an air-gapped RKE2 node.
+> **Audience**: Operators deploying Cyberphy Dask to an air-gapped RKE2 node.
 > Copy-paste every command — variables are set once in Phase 0.
 > Each step links to a Discussion section at the bottom for rationale.
 

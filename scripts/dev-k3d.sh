@@ -89,12 +89,13 @@ cmd_preflight() {
   command -v helm  >/dev/null || die "helm not found"
   command -v tilt  >/dev/null || warn "tilt not found — 'up'/'tilt' will fail until installed"
   command -v uv    >/dev/null || die "uv not found"
-  # devenv MinIO must be live on the host (we reuse it; pods reach it via
-  # host.k3d.internal). 0.0.0.0 bind is set in devenv.nix services.minio.
-  if ! curl -sf --max-time 5 "${S3_ENDPOINT_HOST}/minio/health/live" >/dev/null 2>&1; then
-    die "devenv MinIO not reachable at ${S3_ENDPOINT_HOST} — run 'devenv up' first."
+  # devenv RustFS (local S3) must be live on the host (pods reach it via
+  # host.k3d.internal). 0.0.0.0 bind is set in devenv.nix services.rustfs.
+  if ! curl -sf --max-time 5 "${S3_ENDPOINT_HOST}/health" >/dev/null 2>&1 \
+     && ! curl -sf --max-time 5 "${S3_ENDPOINT_HOST}/minio/health/live" >/dev/null 2>&1; then
+    die "devenv RustFS (local S3) not reachable at ${S3_ENDPOINT_HOST} — run 'devenv up' first."
   fi
-  log "preflight OK (k3d/helm/uv present; MinIO live at ${S3_ENDPOINT_HOST})"
+  log "preflight OK (k3d/helm/uv present; RustFS live at ${S3_ENDPOINT_HOST})"
 }
 
 # ---------------------------------------------------------------- cluster

@@ -1,6 +1,6 @@
 # Workload Overview
 
-The Cybersec Toolkit supports three primary workload patterns, each representing how security teams actually work day-to-day.
+The Cyberphy Toolkit supports three primary workload patterns, each representing how security teams actually work day-to-day.
 
 ## Workload Patterns
 

@@ -103,10 +103,10 @@ Everything below remains first-class. Domain payloads shift toward **CPS + platf
 | Layer | Components |
 |-------|------------|
 | **Stream / flow** | Apache Flink (`flink-cyber/` pipeline toolkit, `thirdparty/flink`), Apache NiFi (`thirdparty/nifi`) |
-| **Table / catalog** | Apache Iceberg (`thirdparty/iceberg`), Apache Polaris (`thirdparty/polaris`), MinIO/S3 |
+| **Table / catalog** | Apache Iceberg (`thirdparty/iceberg`), Apache Polaris (`thirdparty/polaris`), S3/RustFS |
 | **Interactive** | Dask, JupyterHub, Panel OTEL Navigator / Data-View, Navigator engine + PTY |
-| **Local lab** | `devenv` (Postgres, Polaris bootstrap, MinIO, Flink UI, observability ports) |
-| **Python ops** | `cybersec/` package name is transitional (CLI/bootstrap/health/engine); rebrand to cyberphy is incremental |
+| **Local lab** | `devenv` (Postgres, Polaris bootstrap, RustFS/S3, Flink UI, observability ports) |
+| **Python ops** | Import path `cybersec/` (transitional); CLI **`cyberphy`** / **`cyberphy-mcp`** (aliases: `cybersec`, `cybersec-mcp`) |
 
 Build Flink toolkit (no CM packaging):
 
@@ -120,7 +120,7 @@ Local core services:
 
 ```bash
 devenv up
-# Flink :8081 · Iceberg browser :5050 · MinIO :9011 · Polaris :8181 · …
+# Flink :8081 · Iceberg browser :5050 · RustFS (S3) :9010/:9011 · Polaris :8181 · …
 ```
 
 ---
@@ -132,7 +132,7 @@ zarf/           # ★ Zarf releases, converge, air-gap runbooks  (primary delive
 infra/          # ★ OpenTofu AWS + Ansible RKE2 / stack deploy
 flink-cyber/    # Flink pipelines (parse, enrich, index, profile) — no CM parcel/CSD
 thirdparty/     # flink/iceberg/nifi/polaris gitlinks (HTTPS); flink-python vendored PyFlink
-cybersec/       # Python ops + engine (name to be aligned with cyberphy over time)
+cybersec/       # Python ops + engine (import path; product CLI is cyberphy)
 docs/           # Deeper ops / architecture notes
 ```
 
@@ -145,6 +145,19 @@ docs/           # Deeper ops / architecture notes
 - Requiring a full monorepo rebuild to ship a **Zarf** release — zarf image + package is the release unit for the interactive stack  
 
 ---
+
+## Naming (cyberphy vs cybersec)
+
+| Layer | Name | Notes |
+|-------|------|--------|
+| **Product / docs / CLI** | **cyberphy** | Brand, book, `cyberphy` / `cyberphy-mcp` entrypoints |
+| **Python import path** | `cybersec.*` | Transitional; full package rename later |
+| **CLI aliases** | `cybersec`, `cybersec-mcp` | Same code as cyberphy |
+| **Zarf package / image** | `cybersec-dask` | Air-gap drop-in; release assets keep this id |
+| **K8s cluster resource** | `cybersec-dask` DaskCluster | Field deploys already use this name |
+| **Local buckets** | `cyberphy`, `cyberphy-hx` | RustFS at `/raid/build/cyberphy/data/` |
+| **Postgres DB** | `cybersec` (name transitional) | Local catalog DB |
+| **Git remotes** | see below | `origin` is weathership/**cyberphy** |
 
 ## Remotes
 

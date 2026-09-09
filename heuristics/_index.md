@@ -1,4 +1,4 @@
-# Cybersec System Heuristics
+# Cyberphy System Heuristics
 
 This collection contains diagnostic heuristics for the cybersec data pipeline. Each heuristic follows a four-component structure with FMEA integration:
 
@@ -35,7 +35,7 @@ Provider-agnostic naming for swappable components:
 
 - `flink/` - Flink and PyFlink issues (JobManager, TaskManager, Python env, JARs)
 - `rest-catalog/` - REST catalog issues (Polaris)
-- `local-s3/` - Local S3 storage (MinIO)
+- `local-s3/` - Local S3 storage (RustFS; replaces MinIO)
 - `postgres/` - PostgreSQL database
 - `system/` - OS-level issues (shared memory, eBPF)
 - `infra/` - Infrastructure (terraform/ansible)

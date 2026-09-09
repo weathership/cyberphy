@@ -1,6 +1,6 @@
 # Continuous VPC flow log generator with fixed disk envelope.
 # Writes Hive-partitioned parquet to s3://$S3_BUCKET/vpc-flow/ and expires
-# old partitions so MinIO does not fill the node.
+# old partitions so local S3 (RustFS) does not fill the node.
 ---
 apiVersion: v1
 kind: ConfigMap
@@ -48,7 +48,7 @@ spec:
     spec:
       containers:
         - name: generator
-          image: localhost:5555/cybersec-dask:2025.2.0-fbc70781a3
+          image: localhost:5555/cybersec-dask:2025.2.0-74bc219d3a
           imagePullPolicy: IfNotPresent
           command:
             - python

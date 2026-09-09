@@ -1,6 +1,6 @@
 # Complex Systems Integration
 
-The Cybersec Toolkit integrates multiple complex systems that must work together reliably. This chapter covers integration patterns, failure modes, and operational considerations.
+The Cyberphy Toolkit integrates multiple complex systems that must work together reliably. This chapter covers integration patterns, failure modes, and operational considerations.
 
 ## Integration Philosophy
 

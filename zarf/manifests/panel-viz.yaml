@@ -62,12 +62,13 @@ metadata:
     app.kubernetes.io/managed-by: zarf
 type: Opaque
 stringData:
-  # S3/MinIO credentials - populated by Zarf variables
+  # S3 / RustFS credentials - populated by Zarf variables
+  # Local lab: admin/admin against RustFS; AWS air-gap: operator-supplied keys.
   AWS_ACCESS_KEY_ID: "###ZARF_VAR_S3_ACCESS_KEY###"
   AWS_SECRET_ACCESS_KEY: "###ZARF_VAR_S3_SECRET_KEY###"
   # AWS STS session token (for IAM role / temporary credentials)
   AWS_SESSION_TOKEN: "###ZARF_VAR_S3_SESSION_TOKEN###"
-  # Optional: S3 endpoint for MinIO (leave empty for AWS S3)
+  # Optional: S3 endpoint for local RustFS (leave empty for AWS S3)
   S3_ENDPOINT: "###ZARF_VAR_S3_ENDPOINT###"
 ---
 apiVersion: apps/v1
@@ -105,7 +106,7 @@ spec:
       containers:
         - name: otel-navigator
           # Image will be rewritten by Zarf to use internal registry
-          image: localhost:5555/cybersec-dask:2025.2.0-fbc70781a3
+          image: localhost:5555/cybersec-dask:2025.2.0-74bc219d3a
           imagePullPolicy: IfNotPresent
           # Serve OTEL Navigator with ghostty-web WASM assets for terminal
           command:
@@ -126,6 +127,10 @@ spec:
             # Dask scheduler address (deployed in same cluster)
             - name: DASK_SCHEDULER
               value: "tcp://cybersec-dask-scheduler.dask.svc.cluster.local:8786"
+            # Air-gap: Bokeh JS from the Panel/Bokeh server in this pod — never
+            # cdn.bokeh.org. Jupyter uses "inline"; panel serve uses "server".
+            - name: BOKEH_RESOURCES
+              value: "server"
             # PTY proxy WS URL for the embedded terminal (and the `switch` REPL
             # command). Empty = browser auto-detect: :5006 pages target ws://host:8765,
             # anything else falls back to same-origin /ws — which the bundled ingress
@@ -161,7 +166,7 @@ spec:
             failureThreshold: 5
         # PTY proxy sidecar: bridges terminal WebSocket to gRPC engine
         - name: pty-proxy
-          image: localhost:5555/cybersec-dask:2025.2.0-fbc70781a3
+          image: localhost:5555/cybersec-dask:2025.2.0-74bc219d3a
           imagePullPolicy: IfNotPresent
           command:
             - python

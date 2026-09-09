@@ -3,7 +3,7 @@
 # Full E2E Deployment Script
 # =============================================================================
 #
-# Deploys the Cybersec Dask stack (Dask/JupyterHub/Panel) on AWS RKE2 with
+# Deploys the Cyberphy Dask stack (Dask/JupyterHub/Panel) on AWS RKE2 with
 # Cloudflare Zero Trust for secure access via WARP device posture.
 #
 # Prerequisites:
@@ -37,7 +37,7 @@ log_error() { echo -e "${RED}[ERROR]${NC} $*"; }
 print_banner() {
     echo ""
     echo "=============================================================="
-    echo "  Cybersec Dask Stack - E2E Deployment"
+    echo "  Cyberphy Dask Stack - E2E Deployment"
     echo "=============================================================="
     echo ""
 }

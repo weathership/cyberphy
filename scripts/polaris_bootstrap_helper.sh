@@ -108,7 +108,7 @@ verify_bootstrap() {
 
 # Verify catalog exists via Management API
 verify_catalog() {
-    local catalog_name="${1:-cybersec}"
+    local catalog_name="${1:-cyberphy}"
     
     log_info "Verifying catalog '$catalog_name' exists..."
     
@@ -160,10 +160,12 @@ trigger_catalog_init() {
             
             # Verify catalog was actually created
             sleep 2  # Brief pause for API consistency
-            if verify_catalog; then
+            # Prefer POLARIS_CATALOG_NAME / cyberphy (setup_polaris_catalog.sh default)
+            local cat_name="${POLARIS_CATALOG_NAME:-cyberphy}"
+            if verify_catalog "$cat_name"; then
                 return 0
             else
-                log_warn "Catalog setup script succeeded but catalog verification failed"
+                log_warn "Catalog setup script succeeded but catalog verification failed ($cat_name)"
             fi
         else
             log_error "Catalog setup script failed (exit code: $?)"
@@ -466,7 +468,7 @@ if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
             verify_bootstrap
             ;;
         verify-catalog)
-            verify_catalog "${2:-cybersec}"
+            verify_catalog "${2:-cyberphy}"
             ;;
         verify-events)
             verify_events "${2:-1}" "${3:-60}"

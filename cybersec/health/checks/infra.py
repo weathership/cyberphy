@@ -69,52 +69,60 @@ async def check_postgres(ctx: HealthContext) -> CheckResult:
 
 
 async def check_minio(ctx: HealthContext) -> CheckResult:
-    """INFRA_002: Check MinIO health.
+    """INFRA_002: Check local S3 (RustFS) health.
 
-    Queries the MinIO health endpoint.
+    Queries RustFS ``/health``, with legacy MinIO ``/minio/health/live`` fallback.
+    Fact/check id remains ``minio`` for compatibility with rete rules and
+    ``local-s3`` category aliases.
     """
     if not ctx.devenv_running:
         return CheckResult.skipped("devenv not running")
 
     start = time.monotonic()
+    base = ctx.minio_endpoint.rstrip("/")
+    paths = ("/health", "/minio/health/live")
 
     try:
         async with httpx.AsyncClient() as client:
-            resp = await client.get(
-                f"{ctx.minio_endpoint}/minio/health/live",
-                timeout=5.0
-            )
+            last_status = None
+            for path in paths:
+                try:
+                    resp = await client.get(f"{base}{path}", timeout=5.0)
+                    last_status = resp.status_code
+                    if resp.status_code == 200:
+                        duration = int((time.monotonic() - start) * 1000)
+                        result = CheckResult.ok(f"Local S3 (RustFS) OK ({path})")
+                        result.duration_ms = duration
+                        return result
+                except httpx.ConnectError:
+                    raise
+                except Exception:
+                    continue
 
             duration = int((time.monotonic() - start) * 1000)
-
-            if resp.status_code == 200:
-                result = CheckResult.ok("MinIO OK")
-                result.duration_ms = duration
-                return result
-            else:
-                rpn = INFRA_002.calculate_rpn()
-                return CheckResult.critical(
-                    f"MinIO unhealthy: {resp.status_code}",
-                    failure_mode_id="INFRA_002",
-                    rpn=rpn,
-                    remediation="Check MinIO: devenv up minio",
-                    status_code=resp.status_code,
-                    duration_ms=duration,
-                )
+            rpn = INFRA_002.calculate_rpn()
+            return CheckResult.critical(
+                f"Local S3 unhealthy: {last_status}",
+                failure_mode_id="INFRA_002",
+                rpn=rpn,
+                remediation="Start RustFS: devenv up (services.rustfs)",
+                status_code=last_status,
+                duration_ms=duration,
+            )
 
     except httpx.ConnectError:
         duration = int((time.monotonic() - start) * 1000)
         rpn = INFRA_002.calculate_rpn()
         return CheckResult.critical(
-            "MinIO not reachable",
+            "Local S3 (RustFS) not reachable",
             failure_mode_id="INFRA_002",
             rpn=rpn,
-            remediation="Start MinIO: devenv up minio",
+            remediation="Start RustFS: devenv up -d (services.rustfs on :9010)",
             duration_ms=duration,
         )
     except Exception as e:
         duration = int((time.monotonic() - start) * 1000)
-        return CheckResult.error(f"Failed to check MinIO: {e}", duration_ms=duration)
+        return CheckResult.error(f"Failed to check local S3: {e}", duration_ms=duration)
 
 
 async def check_polaris(ctx: HealthContext) -> CheckResult:

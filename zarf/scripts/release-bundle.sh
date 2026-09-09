@@ -20,7 +20,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
 
-VER="${RELEASE_VERSION:-1.6.4}"
+VER="${RELEASE_VERSION:-1.6.7}"
 ZARF_VER="${ZARF_VERSION:-v0.70.1}"
 PKG="zarf/zarf-package-cybersec-dask-amd64-${VER}.tar.zst"
 OUT="build/release"
@@ -36,9 +36,13 @@ mkdir -p "$OUT"
 #    Tarred so `tar xzf … -C <dir>` lays the files directly under <dir> (no wrapper dir).
 echo "→ building $(basename "$ENGINE_TGZ")"
 STAGE="$(mktemp -d)"; trap 'rm -rf "$STAGE"' EXIT
-mkdir -p "$STAGE/manifests"
+mkdir -p "$STAGE/manifests" "$STAGE/scripts"
 cp -R zarf/converge "$STAGE/"
 cp zarf/scripts/converge-node.sh "$STAGE/"
+# S3 datapath probe: catalog resolves scripts/ next to converge/; converge-node.sh
+# also looks at $SELF/verify-s3-datapath.sh (stage root). Ship both paths.
+cp zarf/scripts/verify-s3-datapath.sh "$STAGE/scripts/"
+cp zarf/scripts/verify-s3-datapath.sh "$STAGE/"
 cp zarf/artifacts.manifest.json "$STAGE/"
 cp zarf/manifests/local-path-provisioner.yaml "$STAGE/manifests/"
 for doc in AIRGAP-CONVERGE-RUNBOOK.md AIRGAP-CHEATSHEET.md \

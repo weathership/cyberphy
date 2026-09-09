@@ -162,9 +162,15 @@ async def gather_runtime_config() -> dict[str, Any]:
     }
 
     # Service health checks
+    # Local S3: RustFS /health, with legacy MinIO path fallback
+    _s3_port = os.environ.get("LOCAL_S3_PORT", "9010")
+    _s3_health = await _check_http(f"http://localhost:{_s3_port}/health")
+    if not _s3_health.get("healthy"):
+        _s3_health = await _check_http(f"http://localhost:{_s3_port}/minio/health/live")
+
     runtime["services"] = {
         "postgres": await _check_tcp("localhost", 5438),
-        "minio": await _check_http(f"http://localhost:{os.environ.get('LOCAL_S3_PORT', '9010')}/minio/health/live"),
+        "minio": _s3_health,  # key kept for API compatibility (local-s3 / RustFS)
         "polaris": await _check_http("http://localhost:8182/q/health/ready"),
         "flink": await _check_flink("http://localhost:8081"),
         "iceberg_browser": await _check_http("http://localhost:5050/health"),

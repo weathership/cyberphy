@@ -7,8 +7,8 @@ do not reintroduce `CLAUDE.md`.
 OpenTelemetry from the plant floor and the platform itself, through Flink/NiFi,
 into an Iceberg lakehouse (Polaris + S3), with air-gap delivery via Zarf.
 
-Import path remains `cybersec.*`. CLI `cybersec` / `cybersec-mcp` still work
-(rebrand to `cyberphy` is incremental). Zarf package/image remains
+Import path remains `cybersec.*`. CLI `cyberphy` / `cyberphy-mcp` preferred
+(`cybersec` aliases still work). Zarf package/image remains
 `cybersec-dask` until a dedicated rename. Remote:
 [weathership/cyberphy](https://github.com/weathership/cyberphy).
 
@@ -41,7 +41,7 @@ Guards: `uv run pytest tests/test_flink_portable_paths.py tests/test_flink_paths
 **Never encode site-specific filesystem layouts into converge code.**
 
 Field nodes use different mounts, homes, and directory names. Paths observed on
-one host (`/mnt/…`, `/home/<user>/…`, hostnames) are **not portable**.
+one host (`/mnt/…`, `DHFO_*`, `/home/<user>/…`, hostnames) are **not portable**.
 
 When editing **converge** (`zarf/scripts/converge*.sh`, `zarf/converge/`):
 
@@ -50,11 +50,25 @@ When editing **converge** (`zarf/scripts/converge*.sh`, `zarf/converge/`):
 | argv2 / `--package` path the operator passes | Hardcoded `/mnt/…`, site trees, hostnames |
 | Package next to `converge-node.sh` or in **CWD** | `/home/<user>/…` for package or creds |
 | Optional `/var/tmp` staging | mtime walks across foreign mounts inventing a kit |
+| Generic docs examples (`/tmp`, “NFS of your choice”) | Encoding a past field path as default discovery |
 
 Credentials stay **on the operator’s node only**. Do not invent remote home
 paths for `CONVERGE_CREDS_FILE` or paste secret material into commits/docs.
 
 Guard: `uv run pytest tests/test_converge_portable_paths.py`
+
+## Held backlog (do not implement mid matrix-rerun)
+
+Until the current air-gap/sandbox validation cycle finishes, **do not land**:
+
+1. **Engine T0 CNI root-cause** — iptables absent + IPAM-exhaustion signature
+   (detect/MANUAL; never auto-prune). Details:
+   `docs/scratch/2026-07-30/174410_ci_detour_backlog_cni_matrix.md`
+2. **Matrix case isolation** — post-case cleanup always runs (even on FAIL)
+3. **Matrix stream output** — tee per-case converge logs (no full buffer)
+
+Ship #1 with the next deliberate engine cut after the rerun; #2/#3 with harness
+backlog (case 14+).
 
 ---
 
@@ -132,16 +146,16 @@ The `k8s:prepare-*` tasks use Conftest policies to validate requirements:
 
 CLI/MCP commands:
 ```bash
-cybersec "/k8s"                    # Show status and detected target
-cybersec "/k8s validate aws"       # Validate AWS target
-cybersec "/k8s prepare k3d"        # Prepare k3d target
-cybersec "/k8s prepare aws --dry-run"  # Validate without writing config
+cyberphy "/k8s"                    # Show status and detected target
+cyberphy "/k8s validate aws"       # Validate AWS target
+cyberphy "/k8s prepare k3d"        # Prepare k3d target
+cyberphy "/k8s prepare aws --dry-run"  # Validate without writing config
 ```
 
 ### Service Ports (Core Stack - always started)
 - Flink Web UI: http://localhost:8081
 - Iceberg Browser: http://localhost:5050
-- MinIO Console: http://localhost:9011 (minioadmin/minioadmin)
+- RustFS (local S3) API: http://localhost:9010 · Console: http://localhost:9011/rustfs/console/ (admin/admin)
 - Apache Polaris REST: http://localhost:8181
 - PostgreSQL: port 5438
 - OpenTelemetry Collector: ports 4317 (gRPC), 4318 (HTTP), 8889 (Prometheus)
@@ -263,7 +277,7 @@ When implementing new health checks, fixes, or automation:
 - `JAVA_DATAGEN_RPS`: Rows per second for Java datagen (default: `100`)
 - `ICEBERG_CATALOG_URI`: PostgreSQL connection (default: `postgresql://postgres@localhost:5438/cybersec`)
 - `ICEBERG_WAREHOUSE`: S3 path (default: `s3://cybersec/iceberg/warehouse`)
-- `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`: MinIO credentials (minioadmin/minioadmin)
+- `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`: local RustFS credentials (admin/admin)
 - `S3_ENDPOINT`: MinIO endpoint (http://localhost:9010)
 - `FLINK_HOME` / `FLINK_CONF_DIR` / `FLINK_STATE_DIR`: see Portable Flink artifacts
 
@@ -301,8 +315,8 @@ The bootstrap system provides unified configuration and setup across CLI, Web UI
 On `devenv up`, the bootstrap-check process runs automatically and displays environment status. If bootstrap is needed:
 
 1. **Web UI**: Visit http://localhost:5050/settings and click "Run Bootstrap"
-2. **CLI**: Run `cybersec bootstrap run` or `uv run python -m cybersec.cli.main bootstrap run`
-3. **MCP**: Use the `bootstrap_run` tool
+2. **CLI**: Run `cyberphy bootstrap run` or `uv run python -m cybersec.cli.main bootstrap run`
+3. **MCP**: Use the `bootstrap_run` tool from Claude Code or other MCP clients
 
 ### Bootstrap CLI Commands
 
@@ -311,27 +325,27 @@ On `devenv up`, the bootstrap-check process runs automatically and displays envi
 uv pip install -e .
 
 # Check current configuration
-cybersec bootstrap info
+cyberphy bootstrap info
 
 # Check service health
-cybersec bootstrap status
+cyberphy bootstrap status
 
 # View/modify settings
-cybersec bootstrap settings --show
-cybersec bootstrap settings --edit
-cybersec bootstrap settings --set flink_home=/path/to/flink
+cyberphy bootstrap settings --show
+cyberphy bootstrap settings --edit
+cyberphy bootstrap settings --set flink_home=/path/to/flink
 
 # Run verification checks
-cybersec bootstrap verify
+cyberphy bootstrap verify
 
 # Run bootstrap process
-cybersec bootstrap run
-cybersec bootstrap run --flink-path ~/local/flink-1.20.1
-cybersec bootstrap run --skip-flink
-cybersec bootstrap run --dry-run
+cyberphy bootstrap run
+cyberphy bootstrap run --flink-path ~/local/flink-1.20.1
+cyberphy bootstrap run --skip-flink
+cyberphy bootstrap run --dry-run
 
 # Quick assessment (for automation)
-cybersec bootstrap assess
+cyberphy bootstrap assess
 ```
 
 ### Bootstrap Configuration
@@ -363,7 +377,7 @@ warehouse = "s3://cybersec/iceberg/warehouse"
 ### MCP Server for AI Agents
 
 ```bash
-cybersec-mcp
+cyberphy-mcp
 # Or: uv run python -m cybersec.mcp.server
 ```
 
@@ -408,7 +422,7 @@ The health system provides FMEA-based diagnostics and automated remediation.
 ### Commands (CLI and MCP use identical syntax)
 
 ```bash
-# CLI usage: cybersec "<command>"
+# CLI usage: cyberphy "<command>"   (alias: cybersec "<command>")
 # MCP usage: cmd("<command>")
 
 # Run health checks
@@ -502,7 +516,7 @@ git submodule update --init --recursive
 mvn clean install -DskipTests -Dfast
 
 # Option B: Use existing installation
-cybersec bootstrap settings --set flink_home=/path/to/flink-1.20.1
+cyberphy bootstrap settings --set flink_home=/path/to/flink-1.20.1
 ```
 
 ### E2E Validation Checklist
@@ -527,7 +541,7 @@ NiFi provides data flow visualization and receives OTEL traces:
 ./scripts/setup_nifi_bin.sh 2.0.0
 
 # Or use existing installation
-cybersec bootstrap settings --set nifi_home=/path/to/nifi-2.0.0
+cyberphy bootstrap settings --set nifi_home=/path/to/nifi-2.0.0
 
 # Verify NiFi
 curl http://localhost:8450/nifi-api/system-diagnostics | jq '.systemDiagnostics.aggregateSnapshot.usedHeap'

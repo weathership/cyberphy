@@ -1,4 +1,4 @@
-"""Cybersec Health Check System with FMEA Integration.
+"""Cyberphy Health Check System with FMEA Integration.
 
 This module provides health diagnostics for the cybersec data pipeline,
 using FMEA (Failure Mode and Effects Analysis) for risk-based prioritization.

@@ -121,16 +121,22 @@ _log "== in-cluster probe via $EXEC_NS/$EXEC_TARGET ${EXEC_C:-} =="
 # --------------------------------------------------------------------------- #
 # 3) In-pod check: auth + marker + span parquet (mirrors otel-navigator loader)
 # --------------------------------------------------------------------------- #
-# MIN_PARQUET / ALLOW_EMPTY / CFG_BUCKET injected via env on the exec so we never
-# embed operator secrets; the pod already has AWS_* and S3_ENDPOINT.
+# CRITICAL: kubectl exec needs -i so the heredoc reaches remote `python3 -`.
+# Without -i, the pod gets empty stdin → empty RESULT → host-side json.loads
+# blows up ("Expecting value...") and converge T5.s3-datapath fails as a
+# false negative even when S3 is fine.
+#
+# MIN_PARQUET / ALLOW_EMPTY / CFG_BUCKET injected via env on the exec so we
+# never embed operator secrets; the pod already has AWS_* and S3_ENDPOINT.
 # shellcheck disable=SC2086
-RESULT=$(kc -n "$EXEC_NS" exec $EXEC_TARGET $EXEC_C -- env \
+PROBE_RC=0
+RESULT=$(kc -n "$EXEC_NS" exec -i $EXEC_TARGET $EXEC_C -- env \
   CHECK_BUCKET="$CFG_BUCKET" \
   CHECK_MIN_PARQUET="$MIN_PARQUET" \
   CHECK_ALLOW_EMPTY="$ALLOW_EMPTY" \
   CHECK_CFG_PATH="$CFG_PATH" \
   python3 - <<'PY'
-import json, os, sys, traceback
+import json, os, sys
 
 def die(code, msg, **extra):
     out = {"ok": False, "error": msg, **extra}
@@ -167,6 +173,26 @@ if len(akid) == 0 or len(secret) == 0:
     die(1, "AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY empty in pod env — redeploy with S3 creds", **info)
 if pod_bucket and pod_bucket != bucket:
     info["warning"] = f"pod S3_BUCKET={pod_bucket!r} != ConfigMap {bucket!r}"
+if not endpoint:
+    die(1, "S3_ENDPOINT empty in pod env — Secret may be set but container not restarted "
+           "(rollout restart otel-navigator)", **info)
+
+# Fail fast: TCP to endpoint before s3fs can hang (field converge-26: 180s timeout).
+import socket, urllib.parse
+try:
+    u = urllib.parse.urlparse(endpoint)
+    host = u.hostname or info.get("endpoint_host") or ""
+    port = u.port or (443 if (u.scheme or "https") == "https" else 80)
+    info["endpoint_host"] = host
+    info["endpoint_port"] = port
+    s = socket.create_connection((host, port), timeout=5)
+    s.close()
+    info["tcp_ok"] = True
+except Exception as e:
+    info["tcp_ok"] = False
+    die(1, f"TCP to S3_ENDPOINT failed: {type(e).__name__}: {e} — "
+           f"pod cannot reach endpoint host (network/URL), not a JSON/creds-quote issue",
+        **info)
 
 try:
     import s3fs
@@ -174,17 +200,24 @@ except ImportError as e:
     die(1, f"s3fs not installed in probe image: {e}", **info)
 
 # Match app / RUNBOOK: path-style when a custom endpoint is set (MinIO / gateway).
+# Short botocore timeouts via config_kwargs only — do NOT also pass
+# client_kwargs["config"] (aiobotocore: multiple values for keyword 'config').
 kw = {
     "key": akid,
     "secret": secret,
-    "client_kwargs": {"endpoint_url": endpoint or None, "region_name": region},
+    "client_kwargs": {"endpoint_url": endpoint, "region_name": region},
+    "config_kwargs": {
+        "s3": {"addressing_style": "path"},
+        "connect_timeout": 5,
+        "read_timeout": 20,
+        "retries": {"max_attempts": 2, "mode": "standard"},
+    },
 }
-if endpoint:
-    kw["config_kwargs"] = {"s3": {"addressing_style": "path"}}
 # Session token for temporary IAM creds
 tok = os.environ.get("AWS_SESSION_TOKEN") or ""
 if tok:
     kw["token"] = tok
+socket.setdefaulttimeout(30)
 
 try:
     fs = s3fs.S3FileSystem(**kw)
@@ -199,55 +232,151 @@ try:
 except Exception as e:
     die(1, f"cannot list bucket {bucket!r}: {type(e).__name__}: {e}", **info)
 
-# --- active dataset marker (same as otel-navigator.get_active_dataset) ---
-marker_key = f"{bucket}/_active_dataset.json"
-try:
-    if not fs.exists(marker_key):
-        die(1, f"marker missing: s3://{marker_key} — generate spans or copy marker "
-               f"(OTEL_Data_Generator notebook / generate-otel-data.py)", **info)
-    with fs.open(marker_key, "r") as f:
-        marker = json.load(f)
-except Exception as e:
-    die(1, f"cannot read marker s3://{marker_key}: {e}", **info)
+# --- resolve data root (marker dataset and/or OTEL_DATA_PATH) ---
+# App loads s3://{bucket}/{dataset}/spans/… (partitioned), never only top-level
+# of OTEL_DATA_PATH. Field: OTEL_DATA_PATH=s3://dhfo/otel-notebook/ with parquet
+# under otel-notebook/spans/date=*/hour=*/*.parquet.
+def _s3_key_from_uri(uri: str, default_bucket: str) -> str:
+    """s3://b/prefix/ → b/prefix  (no leading/trailing slash on prefix side)."""
+    u = (uri or "").strip()
+    if u.startswith("s3://"):
+        rest = u[5:].strip("/")
+        return rest
+    return f"{default_bucket}/{u.strip('/')}" if u else default_bucket
 
-dataset = marker.get("dataset") or marker.get("prefix")
-if not dataset:
-    die(1, "marker has no 'dataset' key", marker=marker, **info)
-
-info["marker"] = {
-    "dataset": dataset,
-    "phase": marker.get("phase"),
-    "total_spans": marker.get("total_spans", marker.get("span_count")),
-    "updated_at": marker.get("updated_at"),
-}
-info["dataset_path"] = f"s3://{bucket}/{dataset}/"
-
-# --- span parquet under the active dataset (app loads …/spans/) ---
-# Layouts seen in field: {dataset}/spans/date=…/hour=…/*.parquet
-#                        {dataset}/spans/shard=…/date=…/*.parquet
-patterns = [
-    f"{bucket}/{dataset}/spans/**/*.parquet",
-    f"{bucket}/{dataset}/**/spans/**/*.parquet",
-    f"{bucket}/{dataset}/**/*.parquet",
-]
-files = []
-for pat in patterns:
+def _dataset_roots():
+    """Ordered unique roots to search (bucket/prefix without trailing slash)."""
+    roots = []
+    # 1) marker at bucket root (same as otel-navigator.get_active_dataset)
+    marker_key = f"{bucket}/_active_dataset.json"
+    marker = None
     try:
-        found = fs.glob(pat)
-    except Exception:
-        found = []
-    if found:
-        files = list(found)
-        info["glob_pattern"] = pat
+        if fs.exists(marker_key):
+            with fs.open(marker_key, "r") as f:
+                marker = json.load(f)
+    except Exception as e:
+        die(1, f"cannot read marker s3://{marker_key}: {e}", **info)
+    if marker is not None:
+        ds = (marker.get("dataset") or marker.get("prefix") or "").strip().strip("/")
+        if ds:
+            roots.append(f"{bucket}/{ds}")
+            info["marker"] = {
+                "dataset": ds,
+                "phase": marker.get("phase"),
+                "total_spans": marker.get("total_spans", marker.get("span_count")),
+                "updated_at": marker.get("updated_at"),
+            }
+        else:
+            info["marker_warning"] = "marker has no dataset/prefix key"
+    else:
+        info["marker_warning"] = f"marker missing s3://{marker_key}"
+    # 2) OTEL_DATA_PATH from ConfigMap (may be s3://bucket/otel-notebook/)
+    if cfg_path:
+        root = _s3_key_from_uri(cfg_path, bucket)
+        if root and root not in roots:
+            # If path is just the bucket, skip; need a dataset prefix
+            if root != bucket and root != f"{bucket}/":
+                roots.append(root.rstrip("/"))
+    # de-dupe preserve order
+    seen = set()
+    out_roots = []
+    for r in roots:
+        r = r.rstrip("/")
+        if r and r not in seen:
+            seen.add(r)
+            out_roots.append(r)
+    return out_roots
+
+def _find_span_parquet(data_root: str):
+    """Parquet under {root}/spans/ only (partitioned layout), not top-level of root.
+
+    Mirrors otel-navigator.load_span_data: always append /spans, then partition globs.
+    s3fs ** is unreliable — use find() + explicit partition patterns.
+    """
+    spans = f"{data_root.rstrip('/')}/spans"
+    found = []
+    method = None
+    # Explicit layouts (same order as otel-navigator)
+    patterns = [
+        f"{spans}/shard=*/date=*/batch_*.parquet",
+        f"{spans}/shard=*/date=*/*.parquet",
+        f"{spans}/date=*/hour=*/*.parquet",
+        f"{spans}/date=*/*.parquet",
+        f"{spans}/date=*/hour=*/**/*.parquet",
+    ]
+    for pat in patterns:
+        try:
+            hits = list(fs.glob(pat) or [])
+        except Exception:
+            hits = []
+        hits = [h for h in hits if str(h).endswith(".parquet")]
+        if hits:
+            found, method = hits, f"glob:{pat}"
+            break
+    if not found:
+        try:
+            # Recursive listing under spans/ only (never dataset top-level)
+            entries = fs.find(spans) if fs.exists(spans) else []
+            found = [e for e in entries if str(e).endswith(".parquet")]
+            if found:
+                method = f"find:{spans}"
+        except Exception:
+            found = []
+    return found, spans, method
+
+roots = _dataset_roots()
+if not roots:
+    die(1, "no data root: need _active_dataset.json dataset=… and/or OTEL_DATA_PATH "
+           "with a prefix (e.g. s3://bucket/otel-notebook/)", **info)
+
+files = []
+chosen_root = None
+spans_path = None
+for root in roots:
+    hits, spans_p, method = _find_span_parquet(root)
+    info.setdefault("roots_tried", []).append({
+        "root": f"s3://{root}/",
+        "spans": f"s3://{spans_p}/",
+        "parquet": len(hits),
+        "method": method,
+    })
+    if hits:
+        files = hits
+        chosen_root = root
+        spans_path = spans_p
+        info["glob_pattern"] = method
         break
+
+if not chosen_root:
+    r0 = roots[0]
+    msg = (
+        f"no parquet under s3://{r0}/spans/ (partitioned layout required: "
+        f"spans/date=*/hour=*/*.parquet or spans/shard=*/date=*/*.parquet) — "
+        f"parquet only at top-level of OTEL_DATA_PATH is NOT enough"
+    )
+    if allow_empty:
+        info["ok"] = True
+        info["parquet_count"] = 0
+        info["warning"] = msg
+        print(json.dumps(info))
+        sys.exit(0)
+    die(1, msg, **info)
+
+info["dataset_path"] = f"s3://{chosen_root}/"
+info["spans_path"] = f"s3://{spans_path}/"
+ds_name = chosen_root[len(bucket):].lstrip("/") if chosen_root.startswith(bucket) else chosen_root
+if not isinstance(info.get("marker"), dict):
+    info["marker"] = {"dataset": ds_name}
+elif not info["marker"].get("dataset"):
+    info["marker"]["dataset"] = ds_name
 
 info["parquet_count"] = len(files)
 info["parquet_sample"] = files[:5]
 
 if len(files) < min_pq and not allow_empty:
     die(1,
-        f"found {len(files)} parquet under s3://{bucket}/{dataset}/ "
-        f"(need ≥{min_pq}) — spans not present or wrong prefix",
+        f"found {len(files)} parquet under s3://{spans_path}/ "
+        f"(need ≥{min_pq}) — check partitioned spans layout under dataset root",
         **info)
 
 # --- open first object (read path, not just list) ---
@@ -279,14 +408,51 @@ if files and os.environ.get("CHECK_DEEP") == "1":
 print(json.dumps(info))
 sys.exit(0)
 PY
-) || {
-  # kubectl exec may wrap non-zero; try to still show JSON if present
-  _err "❌ in-cluster probe failed (kubectl exec rc=$?)"
-  if [ -n "${RESULT:-}" ]; then
-    echo "$RESULT" | python3 -m json.tool 2>/dev/null || echo "$RESULT"
-  fi
-  exit 1
-}
+) || PROBE_RC=$?
+
+# Normalize RESULT to a single JSON object (strips kubectl warnings / empty).
+# Always emits valid JSON so host-side never raises JSONDecodeError.
+RESULT=$(printf '%s' "${RESULT:-}" | python3 -c '
+import json, sys
+raw = sys.stdin.read()
+raw_s = (raw or "").strip()
+if not raw_s:
+    print(json.dumps({
+        "ok": False,
+        "error": "empty probe output — kubectl exec did not deliver script stdin "
+                 "(need: kubectl exec -i … -- python3 -). Converge false-negative.",
+    }))
+    sys.exit(0)
+# Prefer last line that is a full JSON object (probe prints one line).
+for line in reversed(raw_s.splitlines()):
+    line = line.strip()
+    if line.startswith("{") and line.endswith("}"):
+        try:
+            json.loads(line)
+            print(line)
+            sys.exit(0)
+        except json.JSONDecodeError:
+            continue
+try:
+    json.loads(raw_s)
+    print(raw_s)
+except json.JSONDecodeError:
+    print(json.dumps({
+        "ok": False,
+        "error": "non-json probe output: " + repr(raw_s[:240]),
+    }))
+')
+
+# Annotate empty/non-json with exec rc when useful
+if [ "$PROBE_RC" -ne 0 ]; then
+  RESULT=$(printf '%s' "$RESULT" | python3 -c '
+import json,sys
+d=json.loads(sys.stdin.read())
+if not d.get("ok") and "kubectl exec" not in (d.get("error") or ""):
+    d["error"] = (d.get("error") or "probe failed") + f" (kubectl exec rc='"$PROBE_RC"')"
+print(json.dumps(d))
+')
+fi
 
 if [ "$JSON" = 1 ]; then
   echo "$RESULT" | python3 -m json.tool 2>/dev/null || echo "$RESULT"
@@ -307,7 +473,9 @@ print("  active dataset:     ", m.get("dataset"))
 print("  marker phase:       ", m.get("phase"))
 print("  marker spans:       ", m.get("total_spans"))
 print("  dataset_path:       ", d.get("dataset_path"))
+print("  spans_path:         ", d.get("spans_path"))
 print("  parquet_count:      ", d.get("parquet_count"))
+print("  discovery:          ", d.get("glob_pattern"))
 print("  sample_readable:    ", d.get("sample_readable"))
 if d.get("parquet_sample"):
     print("  sample keys:")
@@ -323,5 +491,5 @@ print("✔ S3 datapath OK — app can reach configured bucket and read span parq
 '
 fi
 
-# Propagate python exit via JSON ok field
+# Propagate python exit via JSON ok field (RESULT is always valid JSON now)
 echo "$RESULT" | python3 -c 'import json,sys; d=json.load(sys.stdin); sys.exit(0 if d.get("ok") else 1)'

@@ -217,7 +217,7 @@ docs/current/book/
 *.tfplan
 tfplan
 
-# Error screenshots
+*.png
 error.png
 
 # k3d local state

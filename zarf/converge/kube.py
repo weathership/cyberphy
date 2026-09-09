@@ -15,9 +15,10 @@ import json
 import os
 import shutil
 import subprocess
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, List, Optional
+from typing import Any, Callable, List, Optional
 
 DEFAULT_MANIFEST = Path(__file__).resolve().parent.parent / "artifacts.manifest.json"
 # Bundled k8s manifests (local-path-provisioner.yaml) live next to the package source
@@ -47,6 +48,15 @@ class Ctx:
     _zarf_path: Optional[str] = None        # cached PATH guaranteeing kubectl (see zarf())
 
     # ------------------------------------------------------------------ process
+    @staticmethod
+    def out_text(val) -> str:
+        """Normalize subprocess stdout/stderr to str (TimeoutExpired may leave bytes)."""
+        if val is None:
+            return ""
+        if isinstance(val, bytes):
+            return val.decode("utf-8", errors="replace")
+        return str(val)
+
     def run(self, argv: List[str], timeout: Optional[int] = None,
             input_: Optional[str] = None,
             env: Optional[dict] = None) -> subprocess.CompletedProcess:
@@ -63,7 +73,100 @@ class Ctx:
         except FileNotFoundError as e:
             return subprocess.CompletedProcess(argv, 127, "", str(e))
         except subprocess.TimeoutExpired as e:
-            return subprocess.CompletedProcess(argv, 124, e.stdout or "", "timeout")
+            # e.stdout/stderr can be bytes even when text=True was requested
+            return subprocess.CompletedProcess(
+                argv, 124, self.out_text(e.stdout),
+                self.out_text(e.stderr) or "timeout")
+
+    def run_stream(
+        self,
+        argv: List[str],
+        timeout: Optional[int] = None,
+        env: Optional[dict] = None,
+        abort_check: Optional[Callable[[], Optional[str]]] = None,
+        abort_every: float = 10.0,
+        prefix: str = "    | ",
+    ) -> subprocess.CompletedProcess:
+        """Run a long command with live stdout (line-buffered) + optional abort.
+
+        Used for ``zarf package deploy`` so operators see progress and the engine
+        can kill the child on terminal cluster failure (ImagePullBackOff, etc.)
+        instead of waiting the full wall-clock timeout (converge-24: 7200s silent).
+        """
+        if self.verbose:
+            print("    $ " + " ".join(argv), flush=True)
+        run_env = {**os.environ, **env} if env else None
+        wall = timeout or self.timeout
+        try:
+            proc = subprocess.Popen(
+                argv,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+                env=run_env,
+            )
+        except FileNotFoundError as e:
+            return subprocess.CompletedProcess(argv, 127, "", str(e))
+
+        lines: List[str] = []
+        deadline = time.monotonic() + wall
+        next_abort = time.monotonic() + abort_every
+        abort_reason: Optional[str] = None
+        try:
+            import select
+            assert proc.stdout is not None
+            fd = proc.stdout.fileno()
+            while True:
+                now = time.monotonic()
+                if now >= deadline:
+                    abort_reason = f"timeout after {wall}s"
+                    break
+                if abort_check and now >= next_abort:
+                    next_abort = now + abort_every
+                    try:
+                        why = abort_check()
+                    except Exception as e:  # never kill deploy on census bugs
+                        why = None
+                        if self.verbose:
+                            print(f"    (abort_check error ignored: {e})", flush=True)
+                    if why:
+                        abort_reason = why
+                        break
+                if proc.poll() is not None:
+                    rest = proc.stdout.read() or ""
+                    for ln in rest.splitlines():
+                        print(prefix + ln, flush=True)
+                        lines.append(ln + "\n")
+                    break
+                # select so abort/timeout run even when zarf is silent for minutes
+                ready, _, _ = select.select([fd], [], [], 1.0)
+                if not ready:
+                    continue
+                line = proc.stdout.readline()
+                if line:
+                    print(prefix + line.rstrip("\n"), flush=True)
+                    lines.append(line)
+                    if len(lines) > 400:
+                        lines = lines[-250:]
+        finally:
+            if proc.poll() is None:
+                try:
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=8)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        proc.wait(timeout=5)
+                except OSError:
+                    pass
+
+        out = "".join(lines)
+        if abort_reason:
+            return subprocess.CompletedProcess(
+                argv, 125, out, f"aborted: {abort_reason}")
+        rc = proc.returncode if proc.returncode is not None else 1
+        return subprocess.CompletedProcess(argv, rc, out, "")
 
     def k(self, args: List[str], timeout: Optional[int] = None) -> subprocess.CompletedProcess:
         return self.run(self.kubectl + args, timeout=timeout)
@@ -121,8 +224,7 @@ class Ctx:
             Path(self.zarf_bin).exists() or shutil.which(self.zarf_bin) is not None
         )
 
-    def zarf(self, args: List[str], timeout: int = 1800,
-             env: Optional[dict] = None) -> subprocess.CompletedProcess:
+    def _zarf_env(self, env: Optional[dict] = None) -> dict:
         # Zarf component actions run bare `kubectl` in a plain shell — but air-gap
         # RKE2 nodes keep kubectl at /var/lib/rancher/rke2/bin, off root's PATH
         # (field 2026-07-15: every dask-cluster after-action died `kubectl: command
@@ -135,7 +237,32 @@ class Ctx:
             rke2_kc = "/etc/rancher/rke2/rke2.yaml"
             if os.access(rke2_kc, os.R_OK):
                 e.setdefault("KUBECONFIG", rke2_kc)
-        return self.run([str(self.zarf_bin)] + args, timeout=timeout, env=e)
+        return e
+
+    def zarf(self, args: List[str], timeout: int = 3600,
+             env: Optional[dict] = None) -> subprocess.CompletedProcess:
+        # Default timeout 3600s: ``package deploy --components=X`` still pulls
+        # required riders; air-gap image push + helm can exceed 30m. Prefer
+        # ``zarf_stream`` for long deploys so progress is visible.
+        return self.run(
+            [str(self.zarf_bin)] + args, timeout=timeout, env=self._zarf_env(env))
+
+    def zarf_stream(
+        self,
+        args: List[str],
+        timeout: int = 3600,
+        env: Optional[dict] = None,
+        abort_check: Optional[Callable[[], Optional[str]]] = None,
+        abort_every: float = 10.0,
+    ) -> subprocess.CompletedProcess:
+        """Like ``zarf()`` but streams stdout live and supports early abort."""
+        return self.run_stream(
+            [str(self.zarf_bin)] + args,
+            timeout=timeout,
+            env=self._zarf_env(env),
+            abort_check=abort_check,
+            abort_every=abort_every,
+        )
 
     def _path_with_kubectl(self) -> str:
         """PATH for zarf subprocesses that is guaranteed to resolve `kubectl`:

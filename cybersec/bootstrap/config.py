@@ -60,20 +60,20 @@ class BootstrapConfig:
 
     flink_url: str = "http://localhost:8081"
 
-    minio_endpoint: str = "http://localhost:9010"
-    minio_console: str = "http://localhost:9011"
+    minio_endpoint: str = "http://localhost:9010"  # RustFS S3 API
+    minio_console: str = "http://localhost:9011/rustfs/console/"
 
     iceberg_browser_port: int = 5050
 
     # Catalog configuration
-    catalog_name: str = "cybersec"
-    catalog_warehouse: str = "s3://cybersec/iceberg/warehouse"
+    catalog_name: str = "cyberphy"
+    catalog_warehouse: str = "s3://cyberphy/iceberg/warehouse"
 
     # Credentials (for dev convenience; production should use env vars)
     polaris_client_id: str = "admin"
     polaris_client_secret: str = "admin"
-    minio_access_key: str = "minioadmin"
-    minio_secret_key: str = "minioadmin"
+    minio_access_key: str = "admin"
+    minio_secret_key: str = "admin"
 
     # Flink build options
     flink_version: str = "1.20.1"
@@ -114,10 +114,24 @@ class BootstrapConfig:
     developer_email: str = ""  # Empty = auto-detect from git config
 
     def get_minio_data_dir(self) -> Path:
-        """Get MinIO data directory, using default if not set."""
+        """Get local object-store data directory (RustFS).
+
+        Config field name remains ``minio_data_dir`` for toml compatibility.
+        Order: explicit config → ``RUSTFS_DATA_DIR`` →
+        ``/raid/build/cyberphy/data`` → ``$DEVENV_STATE/rustfs/data`` → legacy minio.
+        """
         if self.minio_data_dir:
             return Path(self.minio_data_dir).expanduser()
+        env_dir = os.environ.get("RUSTFS_DATA_DIR", "").strip()
+        if env_dir:
+            return Path(env_dir).expanduser()
+        raid = Path("/raid/build/cyberphy/data")
+        if raid.exists():
+            return raid
         devenv_state = os.environ.get("DEVENV_STATE", ".devenv/state")
+        rustfs = Path(devenv_state) / "rustfs" / "data"
+        if rustfs.exists():
+            return rustfs
         return Path(devenv_state) / "minio"
 
     def get_flink_home(self) -> Optional[Path]:
@@ -310,15 +324,15 @@ class SettingsManager:
 
         # Catalog section
         if "catalog" in data:
-            flat["catalog_name"] = data["catalog"].get("name", "cybersec")
-            flat["catalog_warehouse"] = data["catalog"].get("warehouse", "s3://cybersec/iceberg/warehouse")
+            flat["catalog_name"] = data["catalog"].get("name", "cyberphy")
+            flat["catalog_warehouse"] = data["catalog"].get("warehouse", "s3://cyberphy/iceberg/warehouse")
 
         # Credentials section
         if "credentials" in data:
             flat["polaris_client_id"] = data["credentials"].get("polaris_client_id", "admin")
             flat["polaris_client_secret"] = data["credentials"].get("polaris_client_secret", "admin")
-            flat["minio_access_key"] = data["credentials"].get("minio_access_key", "minioadmin")
-            flat["minio_secret_key"] = data["credentials"].get("minio_secret_key", "minioadmin")
+            flat["minio_access_key"] = data["credentials"].get("minio_access_key", "admin")
+            flat["minio_secret_key"] = data["credentials"].get("minio_secret_key", "admin")
 
         # Flink build section
         if "flink" in data:

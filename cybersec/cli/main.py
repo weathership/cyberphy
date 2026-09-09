@@ -2,16 +2,19 @@
 
 All commands go through the unified command parser shared with MCP:
 
+    cyberphy "/health fix --apply"
+    cyberphy "/bootstrap status --json"
+    cyberphy "/health diagnose FLINK_001"
+
+    # transitional alias (same binary):
     cybersec "/health fix --apply"
-    cybersec "/bootstrap status --json"
-    cybersec "/health diagnose FLINK_001"
 
 Architecture Note
 -----------------
 This CLI is intentionally a thin wrapper around the unified command system in
 `cybersec.commands`. All command logic lives there, ensuring parity between:
 
-    - CLI: cybersec "/health fix --apply"
+    - CLI: cyberphy "/health fix --apply"
     - MCP: cmd("/health fix --apply")
 
 DO NOT add Typer subcommands or duplicate logic here. To add new functionality:
@@ -35,8 +38,8 @@ import typer
 from typing import Optional
 
 app = typer.Typer(
-    name="cybersec",
-    help="Cybersec Toolkit - Security Data Lakehouse CLI",
+    name="cyberphy",
+    help="Cyberphy Toolkit — CPS observability CLI (alias: cybersec)",
     invoke_without_command=True,
 )
 
@@ -54,13 +57,13 @@ def main(
         help='Command to execute (e.g., "/health fix --apply")',
     ),
 ):
-    """Cybersec Toolkit CLI.
+    """Cyberphy Toolkit CLI.
 
     Run unified commands that work identically across CLI and MCP:
 
-        cybersec "/health"
-        cybersec "/health fix --apply"
-        cybersec --cmd "/health fix --apply"
+        cyberphy "/health"
+        cyberphy "/health fix --apply"
+        cyberphy --cmd "/health fix --apply"
 
     Commands:
         /health                 - Run FMEA health diagnostics

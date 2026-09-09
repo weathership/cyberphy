@@ -1,8 +1,11 @@
-# Python dependencies for Cybersec Dask air-gap image
-# These are pre-installed in the container to avoid runtime pip install
+# Python dependencies for Cyberphy Dask / JupyterHub / Panel air-gap image
+# ALL of these are pre-installed at image build — no runtime pip on air-gap nodes.
 #
-# Based on: infra/aws/ansible/roles/panel-viz/files/requirements-panel.txt
-# Pinned versions for reproducibility in air-gap environments
+# Consumers of this image:
+#   - Dask scheduler + workers
+#   - JupyterHub singleuser (same image)
+#   - Panel-Viz (otel-navigator, data-view)
+#   - CPHY HDF5 notebook generator/explorer (h5py + Holoviews/Datashader)
 #
 # IMPORTANT: Dask/distributed/cloudpickle versions MUST match exactly
 # between workers, scheduler, and panel-viz. Version mismatch causes
@@ -18,9 +21,9 @@ pandas==2.2.3
 numpy==2.1.3
 pyarrow==18.1.0
 
-# Visualization (HoloViews stack)
+# Visualization (HoloViews stack) — notebook + Panel-Viz
 holoviews>=1.18.0,<2.0.0
-datashader>=0.16.0,<1.0.0
+datashader>=0.16.3,<1.0.0
 hvplot>=0.9.0,<1.0.0
 bokeh>=3.3.0,<4.0.0
 panel>=1.3.0,<2.0.0
@@ -30,11 +33,18 @@ param>=2.0.0,<3.0.0
 # Graph analysis for topology visualization
 networkx>=3.0,<4.0
 
-# Storage
+# Storage (RustFS / S3-compatible + local)
 fastparquet>=2024.2.0
 fsspec>=2024.2.0
 s3fs>=2024.2.0
 boto3>=1.34.0
+
+# Dense CPHY acquisition windows (HDF5 generator + notebook explorer)
+# REQUIRED for zarf/scripts/generate_hdf5.py and HDF5_CPHY_*.ipynb
+h5py>=3.16.0,<4.0.0
+
+# Optional kerchunk refs (pointer-table / File Format API rehearsal)
+kerchunk>=0.2.5
 
 # OTel protocol definitions (for OTLP parsing)
 opentelemetry-proto>=1.20.0,<2.0.0
@@ -50,13 +60,19 @@ tqdm>=4.66.0,<5.0.0
 # File watching for Panel --autoreload (Tilt live_update support)
 watchfiles>=0.21.0,<1.0.0
 
-# Numba for JIT compilation (datashader dependency)
+# Numba for JIT compilation (datashader dependency; Python 3.10+ image)
 numba>=0.60.0,<1.0.0
 
-# Image processing (fallback rendering)
+# Image processing (datashader export / fallback rendering)
 Pillow>=10.0.0
 
-# Jupyter integration
+# Jupyter integration (singleuser uses this image)
+# Base image is Python 3.10 — jupyter_client 8.7+ uses TypedDict(extra_items=…)
+# which requires 3.13 and crashes singleuser with:
+#   TypeError: unexpected keyword argument 'extra_items'
 jupyterlab>=4.0.0,<5.0.0
 jupyterhub>=5.0.0,<6.0.0
+jupyter_client>=8.0.0,<8.7.0
+jupyter_server>=2.0.0,<2.15.0
 ipywidgets>=8.0.0,<9.0.0
+ipykernel>=6.0.0,<7.0.0

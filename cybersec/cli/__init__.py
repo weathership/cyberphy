@@ -1,4 +1,4 @@
-"""Cybersec CLI - Command line interface for cybersec toolkit."""
+"""Cyberphy CLI — command line interface (import path: cybersec.cli)."""
 
 from .main import app
 

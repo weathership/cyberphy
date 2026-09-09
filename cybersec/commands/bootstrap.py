@@ -328,7 +328,7 @@ def _format_status(results: list, all_healthy: bool) -> str:
 def _format_info(config, settings) -> str:
     """Format info for human display."""
     lines = []
-    lines.append("Cybersec Bootstrap Configuration")
+    lines.append("Cyberphy Bootstrap Configuration")
     lines.append("=" * 40)
     lines.append("")
 

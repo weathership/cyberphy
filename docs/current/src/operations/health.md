@@ -1,6 +1,6 @@
 # Health Diagnostics
 
-The health system provides FMEA-based diagnostics and automated remediation for the Cybersec Toolkit.
+The health system provides FMEA-based diagnostics and automated remediation for the Cyberphy Toolkit.
 
 ## Commands
 

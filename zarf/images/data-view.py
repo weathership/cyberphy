@@ -22,6 +22,9 @@ import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+# Air-gap: Bokeh assets from panel serve (pod-local), never cdn.bokeh.org
+os.environ.setdefault("BOKEH_RESOURCES", "server")
+
 import numpy as np
 import pandas as pd
 import panel as pn

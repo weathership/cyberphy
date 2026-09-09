@@ -1,4 +1,4 @@
-# Cybersec Dask cluster configuration
+# Cyberphy Dask cluster configuration
 #
 # ISOLATION RULE — READ THIS BEFORE CHANGING aws_region
 #

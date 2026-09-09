@@ -80,7 +80,8 @@ sandbox-test-fsm *args: sandbox-config
     bash {{_root}}/infra/aws/tofu-sandbox/test-fsm.sh {{args}}
 
 # ----------------------------------------------------------------------------
-# cybersec-dask IMAGE / PACKAGE / REDEPLOY — content-tagged, registry-pushed,
+# cybersec-dask IMAGE / PACKAGE / REDEPLOY (Zarf wire name; product = Cyberphy)
+# content-tagged, registry-pushed,
 # converge-drift-aware. Replaces the devenv zarf:image / zarf:package tasks; a
 # content-derived tag means every image change is a new tag the drift detect rolls.
 # ----------------------------------------------------------------------------

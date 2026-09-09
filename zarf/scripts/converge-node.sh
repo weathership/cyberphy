@@ -30,10 +30,13 @@
 # ZARF_CONFIG ([package.deploy.set]) — bare ZARF_VAR_* env does NOT template in
 # zarf v0.70.1. Never put secrets on argv / the process table.
 #
-# Env tunables: S3_BUCKET (required for a first deploy), DASK_WORKER_REPLICAS
-# (default 1 — the resilient single-node baseline; raise for bigger clusters, the
-# engine still caps to live capacity), KUBECONFIG, CONVERGE_DYNAMIC_PROVISIONING=1,
-# CONVERGE_NO_REGISTRY_PVC=1.
+# Env tunables: S3_BUCKET (required for a first deploy), worker sizing
+#   DASK_WORKER_REPLICAS (default 4 — multi-core / air-gap baseline; set 1 for
+#     tiny smoke hosts; engine capacity-caps by RAM headroom + Pending)
+#   DASK_WORKER_NTHREADS / DASK_WORKER_CPU / DASK_WORKER_MEMORY (optional;
+#     package defaults 2 / 2 / 6Gi — engine 0.5.0 applies surgically to live CR)
+#   Aliases: DASK_WORKER_MEM_LIMIT → MEMORY, DASK_WORKER_MEM_REQUEST → requests
+# KUBECONFIG, CONVERGE_DYNAMIC_PROVISIONING=1, CONVERGE_NO_REGISTRY_PVC=1.
 set -euo pipefail
 
 MODE="${1:-verify}"
@@ -96,23 +99,65 @@ if [ -z "$KUBECTL_CMD" ]; then
 fi
 
 # --- locate the transported deploy package (optional for verify / kubectl-only) -
-# Search order (newest mtime wins within each step):
-#   1) explicit argv package.tar.zst
-#   2) /var/tmp (runbook default staging)
-#   3) next to this script / engine unpack dir (field: package beside converge)
-#   4) current working directory
-if [ -z "$PKG_ARG" ]; then
-  SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-  PKG_ARG="$(
-    ls -t \
-      /var/tmp/zarf-package-cybersec-dask-amd64-*.tar.zst \
-      "$SCRIPT_DIR"/zarf-package-cybersec-dask-amd64-*.tar.zst \
-      "$SCRIPT_DIR"/../zarf-package-cybersec-dask-amd64-*.tar.zst \
-      ./zarf-package-cybersec-dask-amd64-*.tar.zst \
-      2>/dev/null | head -1 || true
-  )"
+# Paths are NEVER site- or mount-specific (no /mnt/… layouts, remote homes, etc.).
+# Portable sources only — operator chooses where to run and what path to pass:
+#   1) explicit argv2 (absolute or relative path this uid can read)
+#   2) same basename next to this script / in CWD / in /var/tmp
+#   3) any package next to this script / in CWD / in /var/tmp
+# Do not invent packages from other trees.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+_pkg_abs() {
+  local p="$1" d
+  [ -n "$p" ] && [ -f "$p" ] && [ -r "$p" ] || return 1
+  d="$(cd "$(dirname "$p")" && pwd)" || return 1
+  printf '%s\n' "$d/$(basename "$p")"
+}
+_pkg_in_dir() {
+  local dir="$1" c abs
+  shopt -s nullglob
+  for c in "$dir"/zarf-package-cybersec-dask-amd64-*.tar.zst; do
+    abs="$(_pkg_abs "$c")" || continue
+    printf '%s\n' "$abs"
+    shopt -u nullglob
+    return 0
+  done
+  shopt -u nullglob
+  return 1
+}
+
+if [ -n "$PKG_ARG" ]; then
+  if RESOLVED="$(_pkg_abs "$PKG_ARG")"; then
+    PKG_ARG="$RESOLVED"
+  else
+    if [ ! -e "$PKG_ARG" ]; then
+      echo "   ⚠ package path does not exist as $(id -un): ${PKG_ARG}"
+    else
+      echo "   ⚠ package path not readable as $(id -un): ${PKG_ARG}"
+    fi
+    ls -la "$PKG_ARG" 2>&1 | sed 's/^/     /' || true
+    base="$(basename "$PKG_ARG")"
+    if RESOLVED="$(_pkg_abs "$SCRIPT_DIR/$base")" || \
+       RESOLVED="$(_pkg_abs "./$base")" || \
+       RESOLVED="$(_pkg_abs "/var/tmp/$base")"; then
+      echo "   → using co-located package (same basename): $RESOLVED"
+      PKG_ARG="$RESOLVED"
+    else
+      echo "   → pass a path this process can read, or place the package next to"
+      echo "     converge-node.sh / in CWD / in /var/tmp"
+      PKG_ARG=""
+    fi
+  fi
 fi
-[ -n "$PKG_ARG" ] && [ -f "$PKG_ARG" ] && PKG_ARG="$(cd "$(dirname "$PKG_ARG")" && pwd)/$(basename "$PKG_ARG")"
+if [ -z "$PKG_ARG" ]; then
+  if RESOLVED="$(_pkg_in_dir "$SCRIPT_DIR")" || \
+     RESOLVED="$(_pkg_in_dir ".")" || \
+     RESOLVED="$(_pkg_in_dir "/var/tmp")"; then
+    PKG_ARG="$RESOLVED"
+    echo "   package (beside script / CWD /var/tmp): $PKG_ARG"
+  else
+    PKG_ARG=""
+  fi
+fi
 
 # `zarf init` needs the zarf-INIT package (registry/agent/injector images) IN the
 # closed world. It has NO --init-package flag and only looks in the CWD or next to the
@@ -161,15 +206,29 @@ trap cleanup EXIT
 ARGS=(--kubectl "$KUBECTL_CMD")
 [ -f "$MANIFEST_JSON" ] && ARGS+=(--manifest "$MANIFEST_JSON")
 [ -d "$MANIFESTS_DIR" ] && ARGS+=(--manifests-dir "$MANIFESTS_DIR")
-if [ -n "$PKG_ARG" ] && [ -f "$PKG_ARG" ]; then
-  [ -n "$ZARF_BIN" ] && ARGS+=(--zarf "$ZARF_BIN")
+# Always pass zarf when we have one — remediations need it even if package discovery
+# failed (clearer errors). Package is required for component deploy remediations.
+[ -n "$ZARF_BIN" ] && ARGS+=(--zarf "$ZARF_BIN")
+if [ -n "$PKG_ARG" ] && [ -f "$PKG_ARG" ] && [ -r "$PKG_ARG" ]; then
   ARGS+=(--package "$PKG_ARG")
   echo "   package: $PKG_ARG"
 else
-  echo "   package: <none> — component-deploy fixes report MANUAL (verify/teardown still work)"
+  echo "   package: <none> — component-deploy / image-push remediations will MANUAL"
+  echo "            pass a path this process can read as argv2, or place the package"
+  echo "            next to converge-node.sh / in CWD / in /var/tmp, e.g.:"
+  echo "              $0 apply /path/you/chose/zarf-package-cybersec-dask-amd64-1.6.6.tar.zst"
 fi
 [ -n "$CREDS_FILE" ] && ARGS+=(--creds-file "$CREDS_FILE")
-ARGS+=(--set "DASK_WORKER_REPLICAS=${DASK_WORKER_REPLICAS:-1}")
+# Multi-core / air-gap baseline 4; set DASK_WORKER_REPLICAS=1 for tiny smoke hosts
+ARGS+=(--set "DASK_WORKER_REPLICAS=${DASK_WORKER_REPLICAS:-4}")
+# Optional sizing (must keep CPU limit >= nthreads). Engine 0.5.0 patches the live
+# DaskCluster CR + recycles workers — no zarf re-push for scale/size alone.
+[[ -n "${DASK_WORKER_NTHREADS:-}" ]] && ARGS+=(--set "DASK_WORKER_NTHREADS=${DASK_WORKER_NTHREADS}")
+[[ -n "${DASK_WORKER_CPU:-}" ]] && ARGS+=(--set "DASK_WORKER_CPU=${DASK_WORKER_CPU}")
+[[ -n "${DASK_WORKER_MEMORY:-}" ]] && ARGS+=(--set "DASK_WORKER_MEMORY=${DASK_WORKER_MEMORY}")
+# v1.6.5 doc aliases (engine folds → DASK_WORKER_MEMORY / requests.memory)
+[[ -n "${DASK_WORKER_MEM_LIMIT:-}" ]] && ARGS+=(--set "DASK_WORKER_MEM_LIMIT=${DASK_WORKER_MEM_LIMIT}")
+[[ -n "${DASK_WORKER_MEM_REQUEST:-}" ]] && ARGS+=(--set "DASK_WORKER_MEM_REQUEST=${DASK_WORKER_MEM_REQUEST}")
 # Optional terminal-WS override (NodePort/tunnel access; empty = auto-detect / ingress /ws)
 [ -n "${PTY_PROXY_WS:-}" ] && ARGS+=(--set "PTY_PROXY_WS=${PTY_PROXY_WS}")
 # Optional explicit ingress class; engine auto-detects nginx on RKE2 when unset

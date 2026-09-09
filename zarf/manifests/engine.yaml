@@ -43,7 +43,7 @@ spec:
                 topologyKey: kubernetes.io/hostname
       containers:
         - name: navigator-engine
-          image: localhost:5555/cybersec-dask:2025.2.0-fbc70781a3
+          image: localhost:5555/cybersec-dask:2025.2.0-74bc219d3a
           imagePullPolicy: IfNotPresent
           command:
             - python
@@ -65,12 +65,14 @@ spec:
             - secretRef:
                 name: otel-navigator-credentials
           resources:
+            # Field OOM (converge-24/25): 2Gi/4Gi OOMs when engine binds Dask frames.
+            # Bump default; live rem also patches if lastState OOM with lower limits.
             requests:
               cpu: 500m
-              memory: 2Gi
+              memory: 4Gi
             limits:
               cpu: 2
-              memory: 4Gi
+              memory: 8Gi
           readinessProbe:
             tcpSocket:
               port: 50051

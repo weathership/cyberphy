@@ -1,6 +1,6 @@
 # Troubleshooting
 
-Common issues and solutions for the Cybersec Toolkit.
+Common issues and solutions for the Cyberphy Toolkit.
 
 ## Quick Diagnostics
 

@@ -1,34 +1,38 @@
 # Sample Notebooks
 
-These notebooks demonstrate out-of-core processing with Dask and S3.
+**Source of truth:** `zarf/notebooks/` (+ `snippets/cluster_env.py`, `zarf/scripts/generate_hdf5.py`).  
+Rebuild ConfigMap: `python3 zarf/scripts/verify-sample-notebooks.py` before `zarf package create`.
 
-## Available Notebooks
+## In situ (JupyterHub)
 
-| Notebook | Description | Data Size |
-|----------|-------------|-----------|
-| `OTEL_Data_Generator.ipynb` | Generate synthetic OTEL spans (same methodology as 1TB dataset) | Configurable |
-| `Dask_S3_Validation.ipynb` | Out-of-core Dask stress test with 30GB dataset | 30 GB |
+ConfigMap `sample-notebooks` mounts RO at `/root/sample-notebooks/`. On singleuser
+**start**, JH copies to writable `/root/`:
 
-## Getting Started
+- all `*.ipynb` (OTEL, Dask, **HDF5_***)
+- `generate_hdf5.py` (CPHY notebook import)
+- `cluster_env.py`
 
-These notebooks are **read-only** (baked into the image). To edit and run:
+Converge **T5.sample-notebooks** fails if any of those are missing. After package
+deploy: **Stop My Server → Start My Server** so seeds refresh.
 
-```bash
-cp /app/sample-notebooks/OTEL_Data_Generator.ipynb ~/
-```
+Open `/root/HDF5_CPHY_Acquisition_Generator.ipynb` (not the RO mount).
 
-## Environment Variables
+## Notebooks
 
-The following are pre-configured:
-- `DASK_SCHEDULER_ADDRESS`: Dask cluster endpoint
-- `S3_ENDPOINT`: S3 endpoint (if applicable)
-- `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`: S3 credentials
+| Notebook | Role |
+|----------|------|
+| `OTEL_Data_Generator.ipynb` | Spans → `…/spans/date=*/batch_*.parquet` |
+| `Dask_S3_Validation.ipynb` | Explicit LIST + worker parquet |
+| `Dask_S3_Workers_OneCell.ipynb` | Minimal hand-carry (s3fs+dask only) |
+| `HDF5_CPHY_Acquisition_Generator.ipynb` | CPHY HDF5 + Dask (idempotent) |
+| `HDF5_Iceberg_Metadata_Provider.ipynb` | hdf5_iceberg metadata plane |
 
-## Cluster Resources
+## Env (from converge / Zarf)
 
-Default Dask cluster: 32 workers x 6 GiB = 192 GiB
+- `DASK_SCHEDULER_ADDRESS` (not `DASK_SCHEDULER=tcp://…` — breaks dask planning)
+- `S3_ENDPOINT`, `S3_BUCKET`, AWS keys (lab RustFS: `admin`/`admin`)
+- `OTEL_DATA_PATH` / `OTEL_PREFIX`, `HDF5_PROFILE=lab`, `USE_DASK=1`, `BOKEH_RESOURCES=inline`
 
-To scale workers:
-```bash
-kubectl scale deployment cybersec-dask-default-worker -n dask --replicas=64
-```
+## HDF5 notes
+
+Idempotent by default (`ensure_parts`). Force rewrite: `HDF5_FORCE_REGENERATE=1`.

@@ -1,4 +1,4 @@
-# Cybersec Dask — Air-Gap Deployment Runbook
+# Cyberphy Dask — Air-Gap Deployment Runbook
 
 **Package**: `cybersec-dask` v1.4.0
 **Built with**: Zarf **v0.70.1** (the deploy binary and init package MUST match this version)
@@ -37,7 +37,7 @@ mv zarf_v0.70.1_Linux_amd64 zarf && chmod +x zarf
 ./zarf tools download-init
 # produces: zarf-init-amd64-v0.70.1.tar.zst (~390 MB)
 
-# 3. Cybersec Dask package (build from source or download release)
+# 3. Cyberphy Dask package (build from source or download release)
 # Option A: Build  (requires the same zarf v0.70.1 in PATH)
 git clone https://github.com/cloudera/cybersec && cd cybersec
 zarf package create zarf/ --confirm
@@ -163,7 +163,7 @@ kubectl get pods -n zarf
 # agent-hook-*                              1/1     Running
 ```
 
-### Step 6 — Deploy Cybersec Dask
+### Step 6 — Deploy Cyberphy Dask
 
 ```bash
 zarf package deploy zarf-package-cybersec-dask-amd64-1.4.0.tar.zst \
@@ -408,7 +408,7 @@ kubectl delete -f local-path-provisioner.yaml
 | `S3_SECRET_KEY` | _(empty)_ | S3 secret key |
 | `S3_SESSION_TOKEN` | _(empty)_ | AWS STS session token |
 | `INGRESS_CLASS` | `traefik` | Ingress controller class |
-| `INGRESS_DOMAIN` | `cybersec.local` | Base domain for ingress |
+| `INGRESS_DOMAIN` | `cyberphy.local` | Base domain for ingress |
 
 ## Components
 

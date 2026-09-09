@@ -615,7 +615,7 @@ detect_package_file() {
 # Step 6: Deploy Zarf Package (with S3/Dask env vars)
 # =============================================================================
 deploy_package() {
-    log_step "Step 6: Deploying Cybersec Dask Package"
+    log_step "Step 6: Deploying Cyberphy Dask Package"
 
     log_info "Workers: $DASK_WORKER_REPLICAS"
     log_info "Spill dir: ${DASK_SPILL_DIR:-<emptyDir post-patch>}"
@@ -985,7 +985,8 @@ build_custom_image() {
     fi
 
     local DOCKERFILE="$ZARF_DIR/images/Dockerfile.cybersec-dask"
-    local IMAGE_TAG="localhost:5555/cybersec-dask:2025.2.0"
+    # Must match zarf.yaml / manifests (h5py + holoviews baked — no runtime pip)
+    local IMAGE_TAG="localhost:5555/cybersec-dask:2025.2.0-notebook"
 
     if [[ ! -f "$DOCKERFILE" ]]; then
         log_error "Dockerfile not found: $DOCKERFILE"

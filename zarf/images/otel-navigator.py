@@ -14,10 +14,12 @@ Environment variables:
 - S3_BUCKET: S3 bucket name — REQUIRED, provided at deploy time (never hardcoded)
 - OTEL_DATA_PATH: fallback base only; the active dataset is discovered from
   s3://{S3_BUCKET}/_active_dataset.json (the dataset name is never baked in)
-- S3_ENDPOINT: S3 endpoint for MinIO (optional)
+- S3_ENDPOINT: S3 endpoint for local RustFS / S3-compatible gateway (optional)
 - AWS_ACCESS_KEY_ID: S3 access key
 - AWS_SECRET_ACCESS_KEY: S3 secret key
 - AWS_REGION: AWS region (default: us-east-1)
+- PTY_PROXY_WS: optional explicit terminal WebSocket URL (empty = auto-detect)
+- BOKEH_RESOURCES: set to "server" for air-gap panel serve (never cdn.bokeh.org)
 """
 import json
 import logging
@@ -25,6 +27,10 @@ import os
 import threading
 import time
 from datetime import datetime, timedelta, timezone
+
+# Air-gap: force Bokeh assets from the Panel server before any bokeh/panel import.
+# "server" = pod-local static paths; never https://cdn.bokeh.org/
+os.environ.setdefault("BOKEH_RESOURCES", "server")
 
 import colorcet as cc
 import dask.dataframe as dd
@@ -132,7 +138,7 @@ def get_dask_stats() -> dict:
 # -------------------------------------------------------------------------
 
 def get_storage_options() -> dict:
-    # When explicit credentials are provided (e.g. MinIO), use them directly.
+    # When explicit credentials are provided (e.g. RustFS / local S3), use them.
     # When AWS_SESSION_TOKEN is set (IAM role / STS), include it.
     # When no credentials are set, omit key/secret so botocore uses its
     # default credential chain (instance role, env vars, config files).
@@ -144,7 +150,7 @@ def get_storage_options() -> dict:
             opts['token'] = AWS_SESSION_TOKEN
     if S3_ENDPOINT:
         opts['client_kwargs'] = {'endpoint_url': S3_ENDPOINT}
-        # On-prem S3-compatible gateways (MinIO et al.) reached by IP/hostname
+        # On-prem S3-compatible gateways (RustFS et al.) reached by IP/hostname
         # reject AWS virtual-hosted addressing (bucket.endpoint); force
         # path-style (endpoint/bucket) + SigV4. No-op for real AWS S3, which
         # never sets S3_ENDPOINT. This storage_options dict is also serialized

@@ -15,7 +15,7 @@ from typing import Dict, List, Tuple
 
 import time
 
-from .discovery import print_discovery, sweep_vestiges
+from .discovery import functional_surface, print_discovery, sweep_vestiges
 from .kube import Ctx
 from . import manual as _manual
 from .model import Cost, Eval, Invariant, Layer, Outcome
@@ -107,11 +107,15 @@ def reconcile(ctx: Ctx, catalog: List[Invariant]) -> Tuple[Dict[str, Eval], List
 
     Each pass:
       1. Full discovery (entry points → relationships → roots)
-      2. Layer-B vestige sweep (husks, Terminating PVCs, helm pending, junk pods, …)
-      3. Re-detect **every** invariant (no sticky OK — regressions re-enter remediate)
-      4. Remediate broken Layer-B only; Layer-A stays MANUAL
+      2. Functional-surface check — if not Ready across the board, deep
+         partial-rollout unwind is armed inside the vestige sweep
+      3. Layer-B vestige + partial-rollout sweep (helm pending/dead/interrupted,
+         husks, Terminating, stalled Deployments, Failed Jobs, …)
+      4. Re-detect **every** invariant (no sticky OK — regressions re-enter remediate)
+      5. Remediate broken Layer-B only; Layer-A stays MANUAL
 
     Expensive remediations still gated by detect() (skipped when already healthy).
+    Idempotent: a fully Ready surface makes deep unwind a no-op.
     """
     order = topo_order(catalog)
     results: Dict[str, Eval] = {}
@@ -120,16 +124,25 @@ def reconcile(ctx: Ctx, catalog: List[Invariant]) -> Tuple[Dict[str, Eval], List
         progress = False
         print(f"\n  ── reconcile pass {pass_i + 1}/{MAX_PASSES} ──")
         print_discovery(ctx, preview_sweep=False)
+        surface = functional_surface(ctx)
+        if surface.get("ready"):
+            print("  functional surface: Ready across the board")
+        elif not surface.get("partial"):
+            print(f"  functional surface: pre-deploy ({'; '.join(surface.get('issues') or [])})")
+        else:
+            print("  functional surface: NOT ready — partial-rollout unwind armed")
+            for iss in (surface.get("issues") or [])[:8]:
+                print(f"    · {iss}")
         swept = sweep_vestiges(ctx, dry_run=False)
         if swept:
             progress = True
-            print(f"  vestige sweep ({len(swept)} action(s)):")
-            for a in swept[:25]:
+            print(f"  vestige/partial-rollout sweep ({len(swept)} action(s)):")
+            for a in swept[:30]:
                 print(f"    • {a}")
-            if len(swept) > 25:
-                print(f"    … +{len(swept) - 25} more")
+            if len(swept) > 30:
+                print(f"    … +{len(swept) - 30} more")
         else:
-            print("  vestige sweep: clean (no Layer-B husks)")
+            print("  vestige/partial-rollout sweep: clean")
 
         # Fresh results each pass so dependency edges reflect this pass's detects.
         pass_results: Dict[str, Eval] = {}

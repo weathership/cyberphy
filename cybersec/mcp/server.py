@@ -17,8 +17,8 @@ from fastmcp import FastMCP
 
 # Create MCP server
 mcp = FastMCP(
-    name="cybersec",
-    instructions="""Cybersec Toolkit MCP Server
+    name="cyberphy",
+    instructions="""Cyberphy Toolkit MCP Server
 
 Execute commands using the `cmd` tool with slash-prefixed commands:
 

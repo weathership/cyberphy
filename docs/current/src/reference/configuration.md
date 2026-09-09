@@ -1,6 +1,6 @@
 # Configuration
 
-Complete configuration reference for the Cybersec Toolkit.
+Complete configuration reference for the Cyberphy Toolkit.
 
 ## Environment Variables
 

@@ -1,5 +1,5 @@
 #!/bin/bash
-# Install a secondary RKE2 instance for isolated Cybersec Dask deployment
+# Install a secondary RKE2 instance for isolated Cyberphy Dask deployment
 #
 # This script creates a completely separate RKE2 instance that can run
 # alongside an existing RKE2 installation without conflicts.
@@ -421,7 +421,7 @@ main() {
     echo "  2. Initialize Zarf:"
     echo "     zarf init --confirm"
     echo ""
-    echo "  3. Deploy Cybersec Dask:"
+    echo "  3. Deploy Cyberphy Dask:"
     echo "     zarf package deploy zarf-package-cybersec-dask-*.tar.zst --confirm"
     echo ""
     echo "  4. Patch NodePorts (if needed):"

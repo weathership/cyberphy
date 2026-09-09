@@ -228,34 +228,48 @@ class BootstrapService:
             }
 
     async def _check_minio(self) -> dict:
-        """Check MinIO health."""
+        """Check local S3 (RustFS) health.
+
+        Wire name remains ``minio`` for CLI/MCP compatibility; probes RustFS
+        ``/health`` first, then legacy MinIO ``/minio/health/live``.
+        """
         import httpx
 
-        url = f"{self.config.minio_endpoint}/minio/health/live"
+        base = self.config.minio_endpoint.rstrip("/")
+        urls = [f"{base}/health", f"{base}/minio/health/live"]
 
+        last_err: Exception | str | None = None
         try:
             async with httpx.AsyncClient() as client:
-                response = await client.get(url, timeout=5.0)
-                if response.status_code == 200:
-                    return {
-                        "name": "minio",
-                        "status": "up",
-                        "endpoint": self.config.minio_endpoint,
-                        "message": "MinIO is healthy",
-                    }
-                else:
-                    return {
-                        "name": "minio",
-                        "status": "degraded",
-                        "endpoint": self.config.minio_endpoint,
-                        "message": f"HTTP {response.status_code}",
-                    }
+                for url in urls:
+                    try:
+                        response = await client.get(url, timeout=5.0)
+                        if response.status_code == 200:
+                            return {
+                                "name": "minio",
+                                "status": "up",
+                                "endpoint": self.config.minio_endpoint,
+                                "message": "RustFS is healthy",
+                                "display_name": "rustfs",
+                            }
+                        last_err = f"HTTP {response.status_code} at {url}"
+                    except Exception as e:
+                        last_err = e
+                        continue
+                return {
+                    "name": "minio",
+                    "status": "degraded",
+                    "endpoint": self.config.minio_endpoint,
+                    "message": str(last_err) if last_err else "unhealthy",
+                    "display_name": "rustfs",
+                }
         except Exception as e:
             return {
                 "name": "minio",
                 "status": "down",
                 "endpoint": self.config.minio_endpoint,
                 "message": str(e),
+                "display_name": "rustfs",
             }
 
     async def _check_iceberg_browser(self) -> dict:

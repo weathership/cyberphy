@@ -32,12 +32,14 @@ _image_inputs() {
   for f in "$DOCKERFILE" zarf/images/requirements-airgap.txt \
            zarf/images/requirements-agent.txt zarf/images/otel-navigator.py \
            zarf/images/data-view.py zarf/images/data_view_lib.py \
-           zarf/scripts/generate-vpc-flow.py \
+           zarf/scripts/generate-vpc-flow.py zarf/scripts/generate_hdf5.py \
            zarf/images/loader.js; do
     [ -f "$f" ] && echo "$f"
   done
-  find cybersec config zarf/images/sample-notebooks -type f \
-    -not -path '*/__pycache__/*' -not -name '*.pyc' 2>/dev/null
+  # App code + standalone SDK baked into the image (not tag-bearing manifests).
+  find cybersec config packages/hdf5_iceberg zarf/images/sample-notebooks -type f \
+    -not -path '*/__pycache__/*' -not -name '*.pyc' \
+    -not -path '*/.pytest_cache/*' -not -name '*.egg-info' 2>/dev/null
 }
 content_tag() {
   local h
@@ -47,14 +49,44 @@ content_tag() {
 # The source files that carry the image tag (kept in lockstep with the build).
 _tag_files() {
   printf '%s\n' zarf/zarf.yaml zarf/artifacts.manifest.json \
-    zarf/manifests/engine.yaml zarf/manifests/panel-viz.yaml zarf/manifests/dask-cluster.yaml
+    zarf/manifests/engine.yaml zarf/manifests/panel-viz.yaml \
+    zarf/manifests/dask-cluster.yaml zarf/manifests/jupyterhub-values.yaml \
+    zarf/manifests/vpc-flow-generator.yaml
 }
+
+# CLOSURE: every image REFERENCED by a k8s manifest must be DECLARED in
+# artifacts.manifest.json — a ref the package doesn't carry can never pull in
+# the closed world. (Field 2026-07-30: vpc-flow-generator.yaml escaped the
+# lockstep with a stale ':2025.2.0-notebook' tag — 550 ImagePullBackOffs on a
+# fresh air-gap node; masked on upgraded nodes by conserved-registry leftovers.
+# Fix landed as 7d44eb09 on matrix-050; absorb before any 1.6.8 package cut.)
+check_manifest_image_closure() {
+  local refs declared missing=0 r t
+  declared="$(grep -oE "${IMG}:[A-Za-z0-9._-]+" zarf/artifacts.manifest.json | sort -u)"
+  refs="$(grep -rhoE "image: *[a-z0-9.:/-]*${IMG}:[A-Za-z0-9._-]+" zarf/manifests/*.yaml \
+          | grep -oE "${IMG}:[A-Za-z0-9._-]+" | sort -u)"
+  for r in $refs; do
+    t="${r##*:}"
+    case "$t" in \#\#\#*|\**) continue ;; esac   # zarf-templated tags resolve at deploy
+    if ! printf '%s\n' "$declared" | grep -qx "$r"; then
+      echo "  ✗ CLOSURE: zarf/manifests references ${r} but artifacts.manifest.json does not declare it" >&2
+      missing=1
+    fi
+  done
+  return $missing
+}
+
 current_tag() { grep -hoE "${IMG}:[A-Za-z0-9._-]+" zarf/zarf.yaml | head -1 | cut -d: -f2-; }
 bump_tag() {  # idempotent — rewrites the tag in the source manifests only if it changed
   local new="$1" old f
   old="$(current_tag)"
   if [ "$old" = "$new" ]; then echo "  image tag already ${new} (no manifest change)"; return 0; fi
-  for f in $(_tag_files); do sed -i "s|${IMG}:${old}|${IMG}:${new}|g" "$f"; done
+  for f in $(_tag_files); do
+    # Full image refs: cybersec-dask:<old>
+    sed -i "s|${IMG}:${old}|${IMG}:${new}|g" "$f"
+    # Helm values style: tag: "2025.2.0-notebook" (jupyterhub-values.yaml)
+    sed -i "s|tag: \"${old}\"|tag: \"${new}\"|g" "$f"
+  done
   echo "  bumped image tag ${old} -> ${new}"
 }
 
@@ -81,6 +113,14 @@ do_image() {
   echo "[image] done: ${IMG}:${tag}"
 }
 do_package() {
+  # ConfigMap is packaged as a file — must re-embed before create or JH ships stale notebooks.
+  echo "[package] embed + verify sample notebooks (HDF5 + sidecars for in-situ JH seed)..."
+  python3 zarf/scripts/verify-sample-notebooks.py
+  echo "[package] manifest image-closure check (referenced vs declared)..."
+  check_manifest_image_closure || {
+    echo "[package] ERROR: manifest references undeclared image(s) — fix before packaging" >&2
+    exit 1
+  }
   echo "[package] zarf package create (image tag $(current_tag))..."
   ( cd zarf && zarf package create --confirm )
   local pkg; pkg="$(ls -t zarf/zarf-package-${IMG}-amd64-*.tar.zst 2>/dev/null | head -1)"

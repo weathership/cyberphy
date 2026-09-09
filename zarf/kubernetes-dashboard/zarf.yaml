@@ -4,7 +4,7 @@ metadata:
   description: Kubernetes Dashboard for air-gap RKE2 clusters
   version: "2.7.0"
   architecture: amd64
-  authors: Cybersec Toolkit Team
+  authors: Cyberphy Toolkit Team
   url: https://github.com/cloudera/cybersec
 
 components:

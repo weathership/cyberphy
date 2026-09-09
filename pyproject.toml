@@ -1,7 +1,9 @@
 [project]
-name = "cybersec"
+# Distribution / PyPI-style name is cyberphy. Import path remains cybersec.*
+# for wire/compat (CLI: cyberphy preferred; cybersec alias still installed).
+name = "cyberphy"
 version = "0.1.0"
-description = "Cybersec toolkit with Flink processing and Iceberg storage"
+description = "Cyberphy — CPS observability toolkit (Flink, Iceberg, air-gap Zarf stack)"
 readme = "README.md"
 requires-python = ">=3.12,<3.13"  # Pin to 3.12 to avoid Beam envoy-data-plane issues on 3.13+
 dependencies = [
@@ -63,21 +65,30 @@ k8s = [
     "distributed>=2025.2.0",
 ]
 
+# Notebook / Panel / CPHY HDF5 explorer stack (synced by devenv by default).
+# Install alone: uv sync --extra observability
 observability = [
-    # HoloViews visualization stack
+    # HoloViews + Datashader (out-of-core rasterization)
     "holoviews>=1.18.0",
-    "datashader>=0.16.0",
+    "datashader>=0.16.3",
+    "hvplot>=0.9.0",
     "bokeh>=3.3.0",
     "panel>=1.3.0",
     "colorcet>=3.0.0",
     "param>=2.0.0",
-    # Graph analysis
+    # Numba required by datashader (Python 3.12 needs 0.60+)
+    "numba>=0.60.0",
+    # Graph analysis (topology views)
     "networkx>=3.0",
     # OTel protobuf definitions (optional, for OTLP parsing)
     "opentelemetry-proto>=1.20.0",
     "protobuf>=4.0.0",
-    # S3 filesystem support
+    # S3 filesystem (RustFS / local + AWS)
     "s3fs>=2024.2.0",
+    # Dense CPHY acquisition notebooks (h5py also in core deps; keep explicit here)
+    "h5py>=3.16.0",
+    # Pillow for datashader export / fallback rendering
+    "Pillow>=10.0.0",
 ]
 
 # SC26 Benchmark extra - install with: uv sync --extra benchmark
@@ -102,6 +113,10 @@ benchmark = [
 ]
 
 [project.scripts]
+# Preferred product entrypoints
+cyberphy = "cybersec.cli.main:run"
+cyberphy-mcp = "cybersec.mcp.server:run_server"
+# Transitional aliases (same code; import path remains cybersec.*)
 cybersec = "cybersec.cli.main:run"
 cybersec-mcp = "cybersec.mcp.server:run_server"
 

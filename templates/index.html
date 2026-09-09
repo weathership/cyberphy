@@ -158,6 +158,7 @@
             display: flex;
             align-items: center;
             gap: 8px;
+            position: relative;
         }
 
         .service-link:hover {
@@ -170,6 +171,35 @@
             width: 16px;
             height: 16px;
             fill: currentColor;
+        }
+
+        /* Live probe status: green=up, red=down, muted=unknown */
+        .service-link.svc-up {
+            border-color: rgba(76, 175, 80, 0.55);
+            color: var(--text-primary, #e0e0e0);
+        }
+        .service-link.svc-up::after,
+        .service-link.svc-down::after,
+        .service-link.svc-unknown::after {
+            content: "";
+            width: 7px;
+            height: 7px;
+            border-radius: 50%;
+            flex-shrink: 0;
+        }
+        .service-link.svc-up::after {
+            background: #4caf50;
+            box-shadow: 0 0 6px rgba(76, 175, 80, 0.7);
+        }
+        .service-link.svc-down {
+            border-color: rgba(244, 67, 54, 0.4);
+            opacity: 0.75;
+        }
+        .service-link.svc-down::after {
+            background: #f44336;
+        }
+        .service-link.svc-unknown::after {
+            background: #666;
         }
 
         .live-indicator {
@@ -1068,9 +1098,9 @@
                     <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M4 6h2v12H4V6zm14 0h2v12h-2V6zM8 4h8v2H8V4zm0 14h8v2H8v-2zm-1-9h10v6H7V9z"/></svg>
                     Flink
                 </a>
-                <a href="{{ service_urls.minio_console }}" target="_blank" class="service-link" title="MinIO Console" data-service="minio_console">
+                <a href="{{ service_urls.rustfs_console or service_urls.minio_console }}" target="_blank" class="service-link" title="RustFS Console" data-service="rustfs_console">
                     <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M4 4h16v4H4V4zm0 6h16v4H4v-4zm0 6h16v4H4v-4z"/></svg>
-                    MinIO
+                    RustFS
                 </a>
                 <a href="{{ service_urls.nifi }}" target="_blank" class="service-link" title="Apache NiFi" data-service="nifi">
                     <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M3 3h18v18H3V3zm2 2v14h14V5H5zm2 2h4v4H7V7zm6 0h4v4h-4V7zm-6 6h4v4H7v-4zm6 0h4v4h-4v-4z"/></svg>
@@ -1337,12 +1367,43 @@
             }
         }
 
+        // Live service-link probes (server-side /api/services/health)
+        async function probeServiceLinks() {
+            try {
+                const response = await fetch('/api/services/health');
+                if (!response.ok) return;
+                const data = await response.json();
+                const services = data.services || {};
+                document.querySelectorAll('.service-link[data-service]').forEach((el) => {
+                    const key = el.getAttribute('data-service');
+                    const info = services[key];
+                    el.classList.remove('svc-up', 'svc-down', 'svc-unknown');
+                    if (!info) {
+                        el.classList.add('svc-unknown');
+                        return;
+                    }
+                    el.classList.add(info.up ? 'svc-up' : 'svc-down');
+                    const label = info.up ? 'up' : (info.error || 'down');
+                    const prev = el.getAttribute('title') || key;
+                    if (!prev.includes('[')) {
+                        el.setAttribute('title', `${prev} [${label}]`);
+                    } else {
+                        el.setAttribute('title', prev.replace(/\s*\[[^\]]*\]$/, '') + ` [${label}]`);
+                    }
+                });
+            } catch (e) {
+                console.debug('service probe failed', e);
+            }
+        }
+
         // Initialize on page load
         document.addEventListener('DOMContentLoaded', function () {
             loadTheme();  // Load theme first
             loadStats();
             loadEvents();
             initMasonryColumns();
+            probeServiceLinks();
+            setInterval(probeServiceLinks, 15000);
         });
 
         function initMasonryColumns() {

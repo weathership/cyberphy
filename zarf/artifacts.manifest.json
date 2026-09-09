@@ -10,7 +10,7 @@
   ],
   "package": {
     "name": "cybersec-dask",
-    "version": "1.6.4",
+    "version": "1.6.7",
     "size_budget_bytes": 2147483648,
     "size_warn_bytes": 1879048192,
     "_note": "GitHub release-asset hard limit is 2 GiB (2147483648). Warn at ~1.75 GiB so we slim before hitting it."
@@ -31,7 +31,7 @@
   "package_images": {
     "_note": "Layer-A images carried INSIDE the Zarf package and pushed to the internal registry during deploy. The CI gate verifies the built .tar.zst declares all of these (Zarf rewrites localhost:5555 refs to the internal registry on deploy).",
     "images": [
-      { "ref": "localhost:5555/cybersec-dask:2025.2.0-fbc70781a3", "role": "Dask + Panel/HoloViews/Datashader + cybersec app (the ~2 GB image)", "layer": "A", "expensive_push": true },
+      { "ref": "localhost:5555/cybersec-dask:2025.2.0-74bc219d3a", "role": "Dask + Jupyter + Panel/HoloViews/Datashader/h5py + cybersec app (air-gap; no runtime pip)", "layer": "A", "expensive_push": true },
       { "ref": "ghcr.io/dask/dask-kubernetes-operator:2024.1.0", "role": "Dask Kubernetes operator", "layer": "A" },
       { "ref": "quay.io/jupyterhub/k8s-hub:4.0.0", "role": "JupyterHub hub", "layer": "A" },
       { "ref": "quay.io/jupyterhub/configurable-http-proxy:4.5.5", "role": "JupyterHub proxy", "layer": "A" }

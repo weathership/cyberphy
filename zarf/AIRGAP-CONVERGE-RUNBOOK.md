@@ -1,4 +1,4 @@
-# Air-Gap Convergent Deploy — Operator Runbook (v1.6.3)
+# Air-Gap Convergent Deploy — Operator Runbook (v1.6.7)
 
 **Audience.** You have a single-node, air-gapped Kubernetes (RKE2) and need to stand up the
 cybersec-dask / OTEL Navigator stack with **no internet**. The node may already carry a **partial
@@ -53,16 +53,16 @@ Verify integrity (`sha256sum -c SHA256SUMS`), then place each asset:
 
 | Asset | Destination |
 |-------|-------------|
-| `zarf-package-cybersec-dask-amd64-1.6.3.tar.zst` | `/var/tmp/` — **keep only ONE version there** (discovery is newest-by-mtime) |
+| `zarf-package-cybersec-dask-amd64-1.6.7.tar.zst` | `/var/tmp/` — **keep only ONE version there** (discovery is newest-by-mtime) |
 | `zarf-init-amd64-v0.70.1.tar.zst` *(Layer A — the piece partial procedures most often lack)* | `/var/tmp/` (beside the deploy package) |
 | `zarf` *(v0.70.1 binary)* | `/usr/local/bin/zarf` (`chmod +x`) |
-| `cybersec-converge-1.6.3.tar.gz` *(the engine)* | unpack anywhere writable |
+| `cybersec-converge-1.6.7.tar.gz` *(the engine)* | unpack anywhere writable |
 
 ```bash
 sha256sum -c SHA256SUMS
 install -m0755 zarf /usr/local/bin/zarf
-mv zarf-package-cybersec-dask-amd64-1.6.3.tar.zst zarf-init-amd64-v0.70.1.tar.zst /var/tmp/
-mkdir -p ~/cybersec-converge && tar xzf cybersec-converge-1.6.3.tar.gz -C ~/cybersec-converge
+mv zarf-package-cybersec-dask-amd64-1.6.7.tar.zst zarf-init-amd64-v0.70.1.tar.zst /var/tmp/
+mkdir -p ~/cybersec-converge && tar xzf cybersec-converge-1.6.7.tar.gz -C ~/cybersec-converge
 ```
 
 ## 4. Converge — one command
@@ -108,7 +108,198 @@ the authoritative post-state. Exit codes: `0` converged · `1` not converged (re
 diagnosis — it names the unmet condition, never a bare `rc=1`) · `2` CLOSURE violation (a Layer-A
 artifact is missing; re-transport — the engine will not pull).
 
-## 6. First data (closed world) — the OTEL_Data_Generator notebook
+## 6. Upgrade an existing deployment (pre-v1.6.5 → this package)
+
+**Audience.** The cluster already runs an older `cybersec-dask` stack (any release **before**
+this package). The closed world has **no internet** and **no** laptop-side tooling — only the
+assets in this release kit and `converge-node.sh`. Package and image wire names stay
+**`cybersec-dask`** (no rename mid-flight).
+
+### 6.0 REQUIRED preflight — registry lineage, conservation backstop, disk, scaling
+
+Run these BEFORE anything else in this section. They are cheap and reversible,
+and they convert the worst known upgrade failure modes from unrecoverable to
+recoverable.
+
+**(a) Registry lineage probe.** The safe upgrade floor is set by the release
+that ran `zarf init` on this node (upgrades never re-init), not the package
+currently deployed:
+
+```bash
+kubectl -n zarf get pvc zarf-registry -o jsonpath='{.spec.storageClassName}'; echo
+```
+
+- Output **empty** → claimRef lineage (v1.6.1+ init). Continue with §6.
+- Output **non-empty** (e.g. `local-path`) → LEGACY registry on a dynamically
+  provisioned PV with `reclaimPolicy: Delete` — deleting that PVC deletes every
+  transported image. Do NOT run `apply` until (b) is in place, and prefer the
+  clean path: `converge-node.sh teardown` → re-init under this kit → `apply`.
+
+**(b) Conservation backstop — run unconditionally (harmless on claimRef).**
+
+```bash
+PV=$(kubectl -n zarf get pvc zarf-registry -o jsonpath='{.spec.volumeName}')
+kubectl patch pv "$PV" -p '{"spec":{"persistentVolumeReclaimPolicy":"Retain"}}'
+```
+
+With `Retain`, even a mistaken registry PVC deletion leaves the image data on
+disk instead of erasing it.
+
+**(c) Disk gate (imagefs).** The upgrade adds new layers BESIDE old ones in
+both the registry hostPath and containerd. Require free space ≥ 3× the deploy
+package size (this cut: **≥ 4 GiB**) before apply:
+
+```bash
+df -h /var/lib/rancher /var/lib/zarf-registry
+```
+
+kubelet image GC starts at **85% imagefs usage — before any disk-pressure
+taint the engine can observe** — and GC-evicted images are unrecoverable
+air-gapped once the kit tarballs are gone. Free space safely if needed (never
+`crictl rmi`, never prune). Keep BOTH kit tarballs staged in `/var/tmp` until
+`verify` is clean — and retain them afterwards as restore media.
+
+**(d) Preserve worker scaling.** This kit templates `DASK_WORKER_REPLICAS`
+(default **4**) on every apply. If the node was scaled up (e.g. 32 sized
+workers via the v1.6.5 engine), export the CURRENT values before apply or the
+cluster silently resets to 4 template-sized workers:
+
+```bash
+export DASK_WORKER_REPLICAS=32 DASK_WORKER_NTHREADS=2 \
+       DASK_WORKER_CPU=2 DASK_WORKER_MEMORY=28Gi
+```
+
+The v1.6.5 docs' `DASK_WORKER_MEM_REQUEST` / `DASK_WORKER_MEM_LIMIT` names are
+**not** package template vars — use the names above for zarf. Engine **0.5.0+**
+folds those aliases (`MEM_LIMIT`→`MEMORY`, `MEM_REQUEST`→requests.memory) and
+applies **surgical** worker sizing on a live `DaskCluster` (patch CR + bounce
+workers; no image re-push).
+
+**Validation scope.** This upgrade path is procedure-reviewed and its engine
+mechanism (image-tag drift → redeploy) is code-verified. Task **#51** matrix
+inducers (cases **15–17** + **PARTIAL_PUSH** in `infra/aws/tofu-sandbox/test-fsm.sh`)
+are landed; flip this sentence only after that subset is green on a closed-world
+sandbox (`FSM_FILTER='15|16|17|PARTIAL' just sandbox-test-fsm --keep`). Until
+then it is **not** yet runtime-validated. The preflight above is mandatory, not
+optional.
+
+### What the engine does on upgrade
+
+Converge is readiness-based **and** compares the running `cybersec-dask` image tag to the
+**target tag in this kit’s** `artifacts.manifest.json` (shipped inside `cybersec-converge-*.tar.gz`).
+A mismatch is **image drift** → `zarf package deploy` re-pushes layers from the new deploy
+package and rolls panel / Dask / Jupyter / ingress as needed. Content-derived tags (this cut:
+`2025.2.0-85f3d9ecf5`) defeat the stale `IfNotPresent` trap that a fixed tag would hit on
+existing nodes.
+
+**S3 data is preserved** (markers, parquet, CPHY HDF5 under operator prefixes). The package
+does not wipe the registry hostPath; new layers are added beside old ones (plan disk headroom).
+
+### Preconditions (closed world only)
+
+| Check | Requirement |
+|-------|-------------|
+| Node Ready | `kubectl get nodes` |
+| Disk | enough free space for **new image layers** (~deploy package size + headroom); never `crictl rmi --prune` |
+| Deploy package | **exactly one** `zarf-package-cybersec-dask-amd64-*.tar.zst` in discovery paths (`/var/tmp` …) — remove every older tarball |
+| Init package | `zarf-init-amd64-v0.70.1.tar.zst` beside the deploy package (Layer A) |
+| `zarf` binary | **this kit’s** v0.70.x binary — format skew with a stale CLI is unrecoverable air-gapped |
+| Engine | **this kit’s** `cybersec-converge-1.6.7.tar.gz` unpacked (old engine + new package ⇒ wrong target tag) |
+| S3 | same endpoint/bucket/creds the live stack already uses (`S3_BUCKET` required) |
+
+### Procedure
+
+```bash
+# 1. Integrity + replace Layer A (do not leave multiple deploy packages)
+sha256sum -c SHA256SUMS
+install -m0755 zarf /usr/local/bin/zarf
+zarf version    # expect v0.70.x
+
+rm -f /var/tmp/zarf-package-cybersec-dask-amd64-*.tar.zst
+mv zarf-package-cybersec-dask-amd64-1.6.7.tar.zst \
+   zarf-init-amd64-v0.70.1.tar.zst /var/tmp/
+
+# Fresh engine tree (do not mix sources with a previous unpack)
+rm -rf ~/cybersec-converge
+mkdir -p ~/cybersec-converge
+tar xzf cybersec-converge-1.6.7.tar.gz -C ~/cybersec-converge
+
+# 2. Same S3 as the running deployment (secrets off argv)
+umask 077; cat > /dev/shm/s3-creds <<'EOF'
+S3_ENDPOINT=<existing>
+S3_BUCKET=<existing>
+S3_REGION=<existing>
+S3_ACCESS_KEY=<existing>
+S3_SECRET_KEY=<existing>
+EOF
+
+# Optional: NodePort terminal path (ingress /ws needs no extra var)
+#   export PTY_PROXY_WS=ws://<node>:30765
+
+# 3. Converge — image push + component roll; detached if the session may drop
+sudo setsid bash -c 'env CONVERGE_CREDS_FILE=/dev/shm/s3-creds \
+  bash ~/cybersec-converge/converge-node.sh apply; echo $? > /var/tmp/converge.rc' \
+  </dev/null >> /var/tmp/converge.log 2>&1 &
+tail -f /var/tmp/converge.log
+
+# 4. Authoritative post-state
+sudo bash ~/cybersec-converge/converge-node.sh verify
+shred -u /dev/shm/s3-creds
+```
+
+Silence during image push / helm (10–20+ min) is normal. Two flat checks with no pod movement
+⇒ re-read the engine diagnosis line (it names the unmet tier), then re-run `apply` once before
+hand surgery.
+
+### Post-upgrade checks
+
+| Check | Good |
+|-------|------|
+| App image | panel / dask / jupyter singleuser image tag contains the kit content tag (`2025.2.0-85f3d9ecf5`, possibly with a `-zarf-…` rewrite suffix) |
+| Panel UI | ingress `panel.<domain>/otel-navigator` or NodePort `:30506` |
+| Terminal WS | ingress same-origin `/ws` → HTTP 101, or NodePort `:30765` with `PTY_PROXY_WS` set at apply |
+| Data path | `verify` / **T5.s3-datapath** still sees `_active_dataset.json` + readable parquet (existing data) |
+| Sample notebooks | ConfigMap updated; **writable** `/root/*.ipynb` may be stale until re-seed |
+
+**Jupyter home PVC:** startup seeds from the RO ConfigMap, but an existing user server may keep
+old home copies. After singleuser is on the new image, restart the user server **or**:
+
+```bash
+cp /root/sample-notebooks/HDF5_CPHY_Acquisition_Generator.ipynb /root/
+cp /root/sample-notebooks/HDF5_Iceberg_Metadata_Provider.ipynb /root/
+# plus OTEL_Data_Generator / Dask_S3_Validation as needed
+```
+
+### Compatibility (pre-v1.6.5 → 1.6.7)
+
+| Concern | Compatible? |
+|---------|-------------|
+| Wire name `cybersec-dask` (package / image) | Yes — no rename |
+| `converge apply` only (no `just`, no internet) | Yes — intended path |
+| Content image tag change | Yes — forces pull on existing nodes |
+| S3 / OTEL / operator data | Yes — preserved |
+| CPHY prefix `datasets/hdf5/cphy/` | Additive — does not replace older keys |
+| Ingress `/ws` terminal route | Yes if **ingress** is re-applied (this package’s apply does) |
+| Old engine tarball + new deploy package | **No** — always unpack **this** `cybersec-converge-1.6.7` |
+| Multiple deploy packages in `/var/tmp` | **No** — remove extras (mtime discovery) |
+| Stale `zarf` CLI ≠ kit v0.70.x | **No** — install kit binary first |
+
+**Upgrade floor:** §6 as written assumes a **v1.6.1-or-later-initialized**
+registry (probe §6.0a: storageClassName empty). v1.5.0 / v1.6.0-initialized
+nodes: apply §6.0b, then prefer `teardown` → re-init under this kit → `apply`.
+
+### If verify is not clean
+
+1. Re-read the diagnosis (tier + condition).
+2. Re-run `converge-node.sh apply` once (multi-pass fixpoint).
+3. Common upgrade-adjacent tiers: **T0.package-uniqueness**, **T0.layer-a-zarf-tools**,
+   image drift / **T2**, panel LIVE STATE / **T5**, **T5.s3-datapath**.
+4. Layer-B clean slate only: `converge-node.sh teardown` then `apply` (registry + node images
+   **conserved**).
+
+Do **not** `zarf destroy` or prune images for a normal version upgrade.
+
+## 7. First data (closed world) — the OTEL_Data_Generator notebook
 
 The package ships **no data** (by design — datasets are provided or generated on site). The app
 resolves its dataset from `s3://$S3_BUCKET/_active_dataset.json` and **fails loud** (naming the
@@ -135,7 +326,7 @@ carry the S3 endpoint + credentials:
    Manual one-liner equivalent (AIRGAP-DISCOVERY.md §9) still works; the script is the SSOT.
 5. Load/refresh the app — it discovers the dataset from the marker; nothing is hardcoded.
 
-## 7. Access the app + the embedded terminal (`switch` and friends)
+## 8. Access the app + the embedded terminal (`switch` and friends)
 
 - **The app**: `http://panel.<your-ingress-domain>/otel-navigator` (ingress) or
   `http://<node>:30506/otel-navigator` (NodePort).
@@ -157,7 +348,7 @@ carry the S3 endpoint + credentials:
 - In the terminal, `switch` toggles the visualization; both panes rasterize via datashader over
   the Dask workers — viewport interactions fan out as distributed reads.
 
-## 8. Other modes
+## 9. Other modes
 
 - `converge-node.sh dry-run` — what *would* be remediated; changes nothing.
 - `converge-node.sh teardown` — clean-slate the app stack (registry + PV + node images
@@ -165,7 +356,7 @@ carry the S3 endpoint + credentials:
 - `CONVERGE_DYNAMIC_PROVISIONING=1` — opt into the default-StorageClass modality (resourced
   multi-node cluster with a working provisioner).
 
-## 9. What it resolves autonomously
+## 10. What it resolves autonomously
 
 | Symptom | The engine's action |
 |---------|---------------------|
@@ -473,6 +664,28 @@ AND pods Running). Each storage case additionally asserts the registry PVC binds
 `storageClassName=""`. The five v1.6.3 fixes were also validated individually by driving a live
 quadruple-wedged specimen to `✔ CONVERGED` with the engine alone.
 
+### Task #51 matrix extension (engine ≥ 0.5.0 — *inducers landed; runtime pending*)
+
+Harness: `infra/aws/tofu-sandbox/test-fsm.sh` (line of record: **cyberphy `rch/devenv`**).
+
+| Case | Inducer | Primary assert | Post-assert |
+|------|---------|----------------|-------------|
+| **15** legacy-registry Retain | hostPath marker + PV `reclaim=Delete` + delete ns zarf | T1 ok/fixed | reclaim=`Retain`, marker present |
+| **16** registry blip | delete registry Deploy/pods; PV+hostPath stay | T1 ok/fixed | Running + marker; catalog soft |
+| **17** SIGKILL mid-wait | delete scheduler + `timeout -s KILL` zarf deploy (± pending helm) | T1 ok/fixed | no pending helm; scheduler Running |
+| **PARTIAL_PUSH** | wipe target tag under `/var/lib/zarf-registry` (repo remains) | **T2** images-pushed | HEAD 200 or catalog restored |
+
+```bash
+# Full matrix (13 historical + 4 task #51)
+just sandbox-test-fsm --keep
+
+# Task #51 only (node already green / --keep from prior run)
+FSM_FILTER='15|16|17|PARTIAL' just sandbox-test-fsm --keep
+```
+
+When all four are green on a closed-world node, Part I § upgrade may claim the **first
+runtime-validated upgrade path** in this lineage (until then: procedure-reviewed only).
+
 ## Appendix D — anticipatory platform recovery (v1.6.4)
 
 Encoded from a live multi-day air-gap recovery session. The engine's
@@ -510,11 +723,19 @@ helm pending secrets → VolumeAttachments → Dask CR finalizers
 **Apply** additionally, **each reconcile pass**:
 
 1. Print discovery (entry → relationship → root condition)
-2. **Vestige sweep** (Layer-B only): pending helm, agent poison labels, Terminating
-   namespaces/PVCs, junk/Failed pods, Service-only husks, Deploy/STS with zero pods,
-   orphan app PVs, stuck VolumeAttachments, stuck Dask CRs
-3. Re-detect **every** invariant (no sticky OK)
-4. Remediate broken Layer-B tiers
+2. **Functional surface** check (registry, operator, scheduler, otel-navigator, hub)
+3. **Vestige + partial-rollout sweep** (Layer-B only):
+   - **Always:** pending / DEAD / INTERRUPTED helm secrets, agent poison labels,
+     Terminating ns/PVCs, junk pods, husks, orphan app PVs, stuck VolumeAttachments,
+     stuck Dask CR finalizers
+   - **When surface not Ready across the board:** stalled Deployments
+     (ProgressDeadlineExceeded / long unavailable), Failed Jobs, orphan zero
+     ReplicaSets, partial DaskCluster (no scheduler child) notes — so every
+     FSM/zarf intermediate is unwound before the next remediate
+4. Re-detect **every** invariant (no sticky OK)
+5. Remediate broken Layer-B tiers
+
+Idempotent: a fully Ready surface makes deep partial-rollout unwind a no-op.
 
 **Never disposed (Layer-A / foundational):** containerd images, `/var/lib/zarf-registry`
 data, zarf binary + init/deploy packages on disk, RKE2 system namespaces. A Bound
@@ -529,6 +750,6 @@ registry PVC with Ready registry is left intact during sweep.
 | Package mtime races | `T0.package-uniqueness` fails if multiple deploy tarballs | Never deletes packages (Layer-A MANUAL) |
 | Ingress class (traefik on RKE2) | Auto-detect `nginx`; stamp on every deploy; T6 checks class + `/ws` | Redeploy ingress only |
 | Hub SC-less | Package `sqlite-memory` + `storage: none`; T5 deletes any hub PVC/hub-db PV then redeploy | Hub DB ephemeral by design air-gap |
-| Worker default | Deploy path forces `DASK_WORKER_REPLICAS=1` if unset | Capacity cap still applies |
+| Worker default | Deploy path forces `DASK_WORKER_REPLICAS=4` (+ nthreads/cpu/memory defaults) if unset | Engine 0.5.0 capacity-caps by RAM headroom; surgical CR sizing |
 
 Discovery always prints SYSTEM/RKE2 PLANE, LAYER-A PACKAGES, and KUBELET GC POLICY lines.

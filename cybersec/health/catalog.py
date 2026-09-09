@@ -125,7 +125,7 @@ FLINK_003 = FailureMode(
     detection_method="Check checkpoint directory for recent files (< 5 min old)",
     remediation_steps=[
         "Check checkpoint config in Flink job",
-        "Verify MinIO storage is healthy",
+        "Verify local S3 (RustFS) storage is healthy",
         "Review Flink logs for checkpoint errors",
     ],
     observation_level=AutomationLevel.A,
@@ -488,18 +488,18 @@ INFRA_001 = FailureMode(
 INFRA_002 = FailureMode(
     failure_mode_id="INFRA_002",
     category="infra",
-    name="MinIO Unhealthy",
-    description="MinIO object storage not responding",
+    name="Local S3 (RustFS) Unhealthy",
+    description="Local S3 (RustFS) object storage not responding",
     base_severity=9,   # Critical - no data storage
     base_occurrence=2,  # Low - usually stable
     base_detection=2,   # Easy to detect
     symptom="Write failures, 'connection refused' on S3 operations",
-    cause="MinIO process not running or storage full",
-    detection_method="Check /minio/health/live endpoint",
+    cause="RustFS process not running or storage full",
+    detection_method="Check /health endpoint (RustFS; legacy /minio/health/live)",
     remediation_steps=[
-        "Check MinIO health: curl http://localhost:9010/minio/health/live",
-        "Start with devenv: devenv up minio",
-        "Check disk space: df -h /path/to/minio/data",
+        "Check RustFS health: curl http://localhost:9010/health",
+        "Start with devenv: devenv up -d  (services.rustfs)",
+        "Check disk space: df -h $DEVENV_STATE/rustfs/data",
     ],
     observation_level=AutomationLevel.A,
     solution_level=AutomationLevel.A,
@@ -747,7 +747,7 @@ CATEGORIES: dict[str, list[str]] = {
 
     # Provider-agnostic (swappable components)
     "rest-catalog": ["ICE_001", "ICE_002", "ICE_003", "INFRA_003"],  # Iceberg + Polaris
-    "local-s3": ["INFRA_002"],   # MinIO locally
+    "local-s3": ["INFRA_002"],   # RustFS (local S3; historical minio)
 
     # Infrastructure
     "postgres": ["INFRA_001"],
@@ -766,7 +766,7 @@ CATEGORY_ALIASES: dict[str, str] = {
 # Quick checks (critical infrastructure only)
 QUICK_CHECKS: list[str] = [
     "INFRA_001",  # PostgreSQL
-    "INFRA_002",  # MinIO
+    "INFRA_002",  # local-s3 / RustFS
     "FLINK_001",  # TaskManager
     "ICE_002",    # Catalog connection
     "NIFI_002",   # NiFi running

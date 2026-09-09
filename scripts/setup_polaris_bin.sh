@@ -61,7 +61,7 @@ if [ ! -f "$CONF_DIR/application.properties" ]; then
 quarkus.http.port=8181
 quarkus.management.port=8182
 
-# S3 / MinIO configuration for file IO
+# S3 / RustFS configuration for file IO (endpoint + keys via process env)
 polaris.io.impl=org.apache.polaris.service.storage.s3.S3StorageIntegration
 PROPS
 fi

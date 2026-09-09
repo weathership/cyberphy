@@ -1,5 +1,5 @@
 """
-Cybersec Toolkit - CloudTrail Event Pipeline Orchestrator
+Cyberphy Toolkit - CloudTrail Event Pipeline Orchestrator
 
 This provides utilities for:
 1. Checking service health
@@ -27,7 +27,7 @@ class PipelineOrchestrator:
 
         services = {
             "PostgreSQL": ("localhost", 5438),
-            "MinIO": ("localhost", 9010),
+            "RustFS": ("localhost", 9010),
             "Flink JobManager": ("localhost", 8081),
             "Polaris REST": ("localhost", 8181),
         }
@@ -74,7 +74,7 @@ class PipelineOrchestrator:
         print("\n📊 Service URLs:")
         print("  • Flink Dashboard:  http://localhost:8081")
         print("  • Iceberg Browser:  http://localhost:5050")
-        print("  • MinIO Console:    http://localhost:9011")
+        print("  • RustFS Console:   http://localhost:9011")
         print("  • Polaris REST:     http://localhost:8181")
         print("  • PostgreSQL:       localhost:5438 (user: postgres, db: cybersec)")
 
@@ -87,13 +87,13 @@ class PipelineOrchestrator:
 
         print("\n⚙️  Configuration:")
         print("  • Iceberg Catalog: Polaris REST (localhost:8181)")
-        print("  • Iceberg Warehouse: s3://cybersec/iceberg/warehouse (MinIO)")
+        print("  • Iceberg Warehouse: s3://cyberphy/iceberg/warehouse (MinIO)")
 
         print("\n" + "=" * 60)
 
     def run_interactive(self):
         """Run pipeline in interactive mode"""
-        print("\n🚀 Cybersec CloudTrail Pipeline")
+        print("\n🚀 Cyberphy CloudTrail Pipeline")
         print("=" * 60)
 
         if not self.check_services():

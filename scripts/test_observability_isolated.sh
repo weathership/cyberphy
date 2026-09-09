@@ -35,7 +35,7 @@ pip install --quiet \
     pytest>=8.0.0
 
 # Install the project in editable mode (observability only)
-echo "Installing cybersec package..."
+echo "Installing cyberphy package (import path cybersec.*)..."
 pip install --quiet -e "$PROJECT_ROOT" --no-deps
 
 echo ""

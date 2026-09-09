@@ -1,0 +1,43 @@
+[project]
+name = "hdf5-iceberg"
+version = "0.1.0"
+description = "Standalone HDF5 ↔ Iceberg metadata plane: RO dataset providers, isolated metadata warehouse, layout adapters"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Cyberphy / hdf5_iceberg contributors" }]
+keywords = ["hdf5", "iceberg", "pyiceberg", "dask", "air-gap", "dcat", "scientific"]
+dependencies = [
+    "numpy>=1.24",
+    "h5py>=3.10",
+    "pyarrow>=14.0",
+    "fsspec>=2024.2.0",
+    "s3fs>=2024.2.0",
+]
+
+[project.optional-dependencies]
+iceberg = [
+    "pyiceberg[s3fs,sql-sqlite]>=0.7.0",
+]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.2.0",
+]
+
+[project.scripts]
+hdf5-iceberg = "hdf5_iceberg.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/hdf5_iceberg"]
+
+# Map src/ layout → import name hdf5_iceberg
+[tool.hatch.build.targets.wheel.sources]
+"src/hdf5_iceberg" = "hdf5_iceberg"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

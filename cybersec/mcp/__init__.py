@@ -1,4 +1,4 @@
-"""Cybersec MCP Server - Model Context Protocol server for AI agent integration."""
+"""Cyberphy MCP Server — Model Context Protocol for AI agent integration."""
 
 from .server import mcp, run_server
 

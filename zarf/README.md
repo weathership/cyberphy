@@ -1,4 +1,4 @@
-# Cybersec Dask Air-Gap Deployment
+# Cyberphy Dask Air-Gap Deployment
 
 Zarf package for deploying Dask + JupyterHub + Panel-Viz to air-gapped RKE2.
 
@@ -60,7 +60,7 @@ zarf package deploy zarf-package-cybersec-dask-amd64-1.4.0.tar.zst --confirm \
 | `S3_ACCESS_KEY` | _(empty)_ | S3 access key (sensitive) |
 | `S3_SECRET_KEY` | _(empty)_ | S3 secret key (sensitive) |
 | `INGRESS_CLASS` | `traefik` | Ingress controller class |
-| `INGRESS_DOMAIN` | `cybersec.local` | Base domain for ingress |
+| `INGRESS_DOMAIN` | `cyberphy.local` | Base domain for ingress |
 
 ---
 
@@ -237,7 +237,7 @@ Everything else can live on NFS.
 | RKE2 runtime | ~3-5 GB | `/var/lib/rancher` |
 | Zarf registry | ~2 GB | `/var/lib/zarf-registry` (5 Gi PV label) |
 | Zarf init package | ~300 MB | Temporary, consumed during init |
-| Cybersec package | ~1.3 GB | Temporary, consumed during deploy |
+| Cyberphy package | ~1.3 GB | Temporary, consumed during deploy |
 | **Total local** | **~7–9 GB** | Minimum for deployment |
 
 ---

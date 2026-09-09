@@ -67,18 +67,18 @@ proxy:
 
 # Single-user server configuration
 singleuser:
-  # Use custom cybersec-dask image with pre-installed dependencies
-  # Note: Image will be rewritten by Zarf
+  # Air-gap notebook image: holoviews + h5py + generate_hdf5 (requirements-airgap.txt).
+  # MUST match zarf.yaml cybersec-images / dask-cluster (content-derived tag from `just image`).
+  # Zarf rewrites registry and may append -zarf-<hash>.
   image:
     name: localhost:5555/cybersec-dask
-    tag: "2025.2.0"
+    tag: "2025.2.0-74bc219d3a"
     pullPolicy: IfNotPresent
-  # Network tools init container - uses our bundled image
-  # (avoids needing a separate k8s-network-tools image in air-gap)
+  # Network tools init container - same bundled image (air-gap, no extra pulls)
   networkTools:
     image:
       name: localhost:5555/cybersec-dask
-      tag: "2025.2.0"
+      tag: "2025.2.0-74bc219d3a"
       pullPolicy: IfNotPresent
   # Disable block-cloud-metadata init container (requires iptables,
   # which is not present in the cybersec-dask image)
@@ -122,11 +122,50 @@ singleuser:
           mountPath: /srv/jupyterhub-pkg
   # Use 'python -m jupyterhub.singleuser' instead of the 'jupyterhub-singleuser'
   # entry-point script, since the binary is not on PATH in the cybersec-dask image.
+  # Writable home is /root. ConfigMap samples are RO at /root/sample-notebooks/
+  # only — never mount over /app (breaks Lab). At start we *copy* samples into
+  # /root/*.ipynb so the File browser shows editable notebooks at home root
+  # (incl. HDF5_*.ipynb + generate_hdf5.py + cluster_env.py for in-situ HDF5).
+  # "Duplicate" must not target the RO sample-notebooks/ folder.
+  # Converge T5.sample-notebooks requires those CM keys; after redeploy users
+  # must Stop/Start singleuser so this seed runs again.
   cmd:
-    - python
-    - -m
-    - jupyterhub.singleuser
-    - --allow-root
+    - bash
+    - -lc
+    - |
+      set -e
+      HOME_DIR=/root
+      SAMPLES="${HOME_DIR}/sample-notebooks"
+      # Strip stale image-baked notebooks under WORKDIR /app (not used for Lab root)
+      if [ -d /app/sample-notebooks ]; then
+        rm -f /app/sample-notebooks/*.ipynb 2>/dev/null || true
+        rm -rf /app/sample-notebooks/.ipynb_checkpoints 2>/dev/null || true
+        printf '%s\n' \
+          'Jupyter home is /root (writable).' \
+          'Samples are copied there at server start; RO originals: /root/sample-notebooks/' \
+          > /app/sample-notebooks/README.md 2>/dev/null || true
+      fi
+      # Seed writable working copies in HOME (ConfigMap mount is read-only)
+      if [ -d "$SAMPLES" ]; then
+        for f in "$SAMPLES"/*.ipynb "$SAMPLES"/generate_hdf5.py "$SAMPLES"/cluster_env.py; do
+          [ -f "$f" ] || continue
+          base=$(basename "$f")
+          # Always refresh from ConfigMap so users get latest samples after redeploy
+          cp -f "$f" "${HOME_DIR}/${base}"
+        done
+        # Import path for `from cluster_env import …` without PYTHONPATH hacks
+        if [ -f "${HOME_DIR}/cluster_env.py" ]; then
+          export PYTHONPATH="${HOME_DIR}:${PYTHONPATH:-}"
+        fi
+        printf '%s\n' \
+          'sample-notebooks/ is READ-ONLY (ConfigMap).' \
+          'Editable copies are in this folder (/root/*.ipynb) — open those.' \
+          'Do not Duplicate inside sample-notebooks/ (Errno 30).' \
+          > "${HOME_DIR}/README.txt"
+      fi
+      exec python -m jupyterhub.singleuser --allow-root \
+        --ServerApp.root_dir=/root \
+        --ServerApp.preferred_dir=/root
   # Run as root (UID 0) because the Dask base image has no 'jovyan' user.
   # Z2JH defaults runAsUser=1000 but the cybersec-dask image only has root.
   uid: 0
@@ -145,8 +184,7 @@ singleuser:
   # change type to 'dynamic'.
   storage:
     type: none
-    # Mount sample notebooks from ConfigMap (read-only)
-    # Users copy to ~/work to edit
+    # RO samples under $HOME/sample-notebooks; startup copies to $HOME/*.ipynb
     extraVolumes:
       - name: sample-notebooks
         configMap:
@@ -156,32 +194,50 @@ singleuser:
           sizeLimit: 256Mi
     extraVolumeMounts:
       - name: sample-notebooks
-        mountPath: /app/sample-notebooks
+        mountPath: /root/sample-notebooks
         readOnly: true
       - name: jupyterhub-pkg
         mountPath: /srv/jupyterhub-pkg
         readOnly: true
   # Network policy - allow singleuser pods full egress to reach:
   #   - Dask scheduler (10.43.x.x ClusterIP or dask.svc.cluster.local)
-  #   - MinIO/S3 on host network (192.168.x.x)
+  #   - RustFS/S3 on host network (192.168.x.x)
   #   - Any other cluster services
   # Default JupyterHub NetworkPolicy blocks private IPs in egress,
   # which prevents notebook access to Dask and S3.
   networkPolicy:
     egressAllowRules:
       privateIPs: true
-  # Environment variables for S3 access
+  # Environment variables for S3 access (RustFS lab: admin/admin, bucket cyberphy)
   extraEnv:
-    # Make the injected jupyterhub package importable
-    PYTHONPATH: "/srv/jupyterhub-pkg"
+    # jupyterhub pkg (init inject) + /app for generate_hdf5.py (image-baked, not under ConfigMap)
+    PYTHONPATH: "/srv/jupyterhub-pkg:/app"
     # Ensure HOME is writable (Dask base image runs as root)
     HOME: "/root"
+    # Prefer HOME as Jupyter contents root even if image WORKDIR is /app
+    JUPYTER_SERVER_ROOT: "/root"
     S3_ENDPOINT: "###ZARF_VAR_S3_ENDPOINT###"
     AWS_ACCESS_KEY_ID: "###ZARF_VAR_S3_ACCESS_KEY###"
     AWS_SECRET_ACCESS_KEY: "###ZARF_VAR_S3_SECRET_KEY###"
+    # Optional STS (empty when using long-lived keys)
+    AWS_SESSION_TOKEN: "###ZARF_VAR_S3_SESSION_TOKEN###"
     S3_BUCKET: "###ZARF_VAR_S3_BUCKET###"
-    # Dask scheduler address in same cluster
+    # Region + dataset path — same vars converge patches into panel-viz ConfigMap
+    AWS_REGION: "###ZARF_VAR_S3_REGION###"
+    AWS_DEFAULT_REGION: "###ZARF_VAR_S3_REGION###"
+    S3_REGION: "###ZARF_VAR_S3_REGION###"
+    # s3://$S3_BUCKET/ when unset at package time; operators may set OTEL_DATA_PATH
+    OTEL_DATA_PATH: "s3://###ZARF_VAR_S3_BUCKET###/otel-notebook/"
+    OTEL_PREFIX: "otel-notebook"
+    # Distributed Client address only. Do NOT set DASK_SCHEDULER=tcp://… here:
+    # dask maps DASK_SCHEDULER env → config.scheduler *type* (threads|distributed|…),
+    # and dd.read_parquet planning then raises ValueError on the tcp:// string.
     DASK_SCHEDULER_ADDRESS: "tcp://cybersec-dask-scheduler.dask.svc.cluster.local:8786"
+    USE_DASK: "1"
+    # HDF5_CPHY notebook profile (lab | lab_tiny | airgap) — generate_hdf5.PROFILES
+    HDF5_PROFILE: "lab"
+    # Air-gap: do not load Bokeh/HoloViews JS from cdn.bokeh.org (blank plots otherwise)
+    BOKEH_RESOURCES: "inline"
 
 # Scheduling - allow users on any node
 scheduling:

@@ -1,5 +1,5 @@
 #!/bin/bash
-# Post-deployment verification script for Cybersec Dask package
+# Post-deployment verification script for Cyberphy Dask package
 #
 # This script runs after Zarf deploys all components to verify
 # the deployment is working correctly.
@@ -8,7 +8,7 @@
 
 set -e
 
-echo "=== Cybersec Dask Post-Deployment Verification ==="
+echo "=== Cyberphy Dask Post-Deployment Verification ==="
 echo ""
 
 # Check namespaces

@@ -72,7 +72,15 @@ locals {
     exec > /var/log/sandbox-bootstrap.log 2>&1
     set -ux
     echo "STATUS=installing-rke2" > /var/tmp/bootstrap-status
-    curl -sfL https://get.rke2.io | sh -
+    # tar method: installs from GitHub releases — immune to the rpm.rancher.io
+    # repo-layout 404 that broke the RPM path (observed 2026-07-30:
+    # rke2/stable/stable/centos/8 repomd.xml -> 404, no rke2-server unit).
+    # The RPM path also pulled OS deps; tar does not — AL2023 ships NO iptables
+    # userland, and without it the portmap CNI fails AFTER calico allocates an
+    # IP, leaking one per retry until the /24 exhausts (observed: x360 retries,
+    # then "no IP addresses available in range set: 10.42.0.1-10.42.0.254").
+    dnf install -y iptables-nft
+    curl -sfL https://get.rke2.io | INSTALL_RKE2_METHOD=tar sh -
     systemctl enable --now rke2-server.service
     for i in $(seq 1 60); do [ -f /etc/rancher/rke2/rke2.yaml ] && break; sleep 5; done
     ln -sf /var/lib/rancher/rke2/bin/kubectl /usr/local/bin/kubectl

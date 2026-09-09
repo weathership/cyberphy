@@ -2,9 +2,9 @@ kind: ZarfPackageConfig
 metadata:
   name: cybersec-dask
   description: Air-gap deployment package for Dask, JupyterHub, and Panel-Viz on RKE2
-  version: "1.6.4"
+  version: "1.6.7"
   architecture: amd64
-  authors: Cybersec Toolkit Team
+  authors: Cyberphy Toolkit Team
   url: https://github.com/cloudera/cybersec
   documentation: https://cloudera.github.io/cybersec/airgap-deployment.html
 
@@ -20,12 +20,23 @@ variables:
     default: nginx
   - name: INGRESS_DOMAIN
     description: Base domain for ingress hostnames
-    default: cybersec.local
+    default: cyberphy.local
 
-  # Dask configuration
+  # Dask configuration (multi-core / multi-node: raise REPLICAS for HDF5 2 TiB)
   - name: DASK_WORKER_REPLICAS
-    description: Number of Dask worker replicas (1 = resilient single-node baseline)
-    default: "1"
+    description: >-
+      Number of Dask worker pods. Use 4–8 on a multi-core lab node; 16–32 (or
+      ~2–4× node count) for air-gap 2 TiB HDF5. Set 1 only for tiny/smoke hosts.
+    default: "4"
+  - name: DASK_WORKER_NTHREADS
+    description: Threads per worker (--nthreads). Keep ≤ DASK_WORKER_CPU.
+    default: "2"
+  - name: DASK_WORKER_CPU
+    description: Per-worker CPU limit (must be ≥ NTHREADS or workers stay serial).
+    default: "2"
+  - name: DASK_WORKER_MEMORY
+    description: Per-worker memory limit and dask-worker --memory-limit (e.g. 6Gi).
+    default: "6Gi"
   - name: DASK_SPILL_DIR
     description: Host path for Dask worker spill-to-disk (set to NFS mount if available)
     default: /tmp/dask-spill
@@ -119,11 +130,13 @@ components:
   # ===========================================================================
   - name: cybersec-images
     required: true
-    description: Container images for Cybersec Dask deployment
+    description: Container images for Cyberphy Dask deployment
     images:
-      # Custom Dask image with pre-baked Python dependencies (Panel, HoloViews, etc.)
-      # Note: Use localhost:5555 for local builds, will be rewritten by Zarf during deploy
-      - localhost:5555/cybersec-dask:2025.2.0-fbc70781a3
+      # Single air-gap app image: Dask + Jupyter + Panel + h5py/holoviews (requirements-airgap.txt).
+      # Build: podman build -t localhost:5555/cybersec-dask:2025.2.0-74bc219d3a \
+      #          -f zarf/images/Dockerfile.cybersec-dask .
+      # FAIL the package create if this tag is missing or lacks h5py — no runtime pip.
+      - localhost:5555/cybersec-dask:2025.2.0-74bc219d3a
       # Dask Kubernetes Operator
       - ghcr.io/dask/dask-kubernetes-operator:2024.1.0
 
@@ -166,8 +179,31 @@ components:
                 name: dask.org/component=scheduler
                 namespace: dask
                 condition: Ready
-            maxTotalSeconds: 300
+            maxTotalSeconds: 900
             description: Wait for Dask scheduler to be ready
+          - cmd: |
+              # Fail loud if the packaged image is missing notebook deps (air-gap: no pip).
+              SCHEDULER=$(./zarf tools kubectl get pod -n dask -l dask.org/component=scheduler -o jsonpath='{.items[0].metadata.name}')
+              if [ -z "$SCHEDULER" ]; then
+                echo "Warning: no Dask scheduler pod — skip h5py smoke"
+                exit 0
+              fi
+              ./zarf tools kubectl exec -n dask "$SCHEDULER" -- python -c "
+              import sys
+              missing = []
+              for m in ('h5py', 'holoviews', 'datashader', 's3fs', 'distributed', 'numpy'):
+                  try:
+                      __import__(m)
+                  except Exception as e:
+                      missing.append('%s (%s)' % (m, e))
+              if missing:
+                  print('AIRGAP IMAGE MISSING DEPS:', ', '.join(missing))
+                  print('Rebuild cybersec-dask:2025.2.0-74bc219d3a from Dockerfile.cybersec-dask')
+                  sys.exit(1)
+              import h5py, holoviews
+              print('airgap image OK: h5py', h5py.__version__, 'holoviews', holoviews.__version__)
+              "
+            description: Verify packaged image has h5py/holoviews (no runtime pip)
           - cmd: |
               BUCKET="${ZARF_VAR_S3_BUCKET}"
               ENDPOINT="${ZARF_VAR_S3_ENDPOINT}"
@@ -225,7 +261,7 @@ components:
       - quay.io/jupyterhub/k8s-hub:4.0.0
       - quay.io/jupyterhub/configurable-http-proxy:4.5.5
       # User notebook environment uses the custom cybersec-dask image
-      - localhost:5555/cybersec-dask:2025.2.0-fbc70781a3
+      - localhost:5555/cybersec-dask:2025.2.0-74bc219d3a
     charts:
       - name: jupyterhub
         namespace: jupyterhub
@@ -301,7 +337,11 @@ components:
   - name: sample-notebooks
     required: false
     default: true
-    description: Sample notebooks for OTEL data generation and Dask validation
+    description: >-
+      Sample notebooks ConfigMap for JupyterHub in situ (OTEL + Dask + HDF5).
+      Seeds /root/*.ipynb, generate_hdf5.py, cluster_env.py at singleuser start.
+      Rebuild with: python3 zarf/scripts/verify-sample-notebooks.py before package create.
+      Converge T5.sample-notebooks requires HDF5 keys + sidecars.
     manifests:
       - name: sample-notebooks-manifests
         namespace: jupyterhub

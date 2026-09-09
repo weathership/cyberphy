@@ -3,7 +3,7 @@ from pyiceberg.catalog import load_catalog
 catalog = load_catalog('cybersec', **{
     'type': 'sql',
     'uri': 'postgresql://cybersec:cybersec@localhost:5438/iceberg',
-    'warehouse': 's3://cybersec/iceberg/warehouse',
+    'warehouse': 's3://cyberphy/iceberg/warehouse',
     's3.endpoint': 'http://localhost:9010',
     's3.path-style-access': 'true',
     's3.access-key-id': 'minioadmin',

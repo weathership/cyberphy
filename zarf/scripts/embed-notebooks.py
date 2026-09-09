@@ -20,12 +20,20 @@ from pathlib import Path
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent.parent
 NOTEBOOKS_DIR = PROJECT_ROOT / "zarf" / "notebooks"
+GENERATOR_SCRIPT = PROJECT_ROOT / "zarf" / "scripts" / "generate_hdf5.py"
+# Prefer scripts/generate_hdf5.py; fall back to notebooks tree / image copy
+if not GENERATOR_SCRIPT.is_file():
+    GENERATOR_SCRIPT = PROJECT_ROOT / "zarf" / "images" / "sample-notebooks" / "generate_hdf5.py"
+CLUSTER_ENV_SCRIPT = PROJECT_ROOT / "zarf" / "notebooks" / "snippets" / "cluster_env.py"
 OUTPUT_FILE = PROJECT_ROOT / "zarf" / "manifests" / "sample-notebooks-configmap.yaml"
 
 # Notebooks to include (order matters for README table)
 INCLUDE_NOTEBOOKS = [
     "OTEL_Data_Generator.ipynb",
     "Dask_S3_Validation.ipynb",
+    "Dask_S3_Workers_OneCell.ipynb",
+    "HDF5_CPHY_Acquisition_Generator.ipynb",
+    "HDF5_Iceberg_Metadata_Provider.ipynb",
 ]
 
 # ConfigMap limit is 1 MiB; warn if we get close
@@ -76,37 +84,70 @@ def main():
     readme = textwrap.dedent("""\
         # Sample Notebooks
 
-        These notebooks demonstrate out-of-core processing with Dask and S3.
+        Seeded **in situ** by JupyterHub: ConfigMap mount at ``/root/sample-notebooks/``
+        (RO), copied to writable ``/root/*`` on singleuser start. Converge task
+        ``T5.sample-notebooks`` requires all notebooks below + ``generate_hdf5.py``
+        + ``cluster_env.py`` so HDF5 samples work after package deploy.
 
         ## Available Notebooks
 
-        | Notebook | Description | Data Size |
-        |----------|-------------|-----------|
-        | `OTEL_Data_Generator.ipynb` | Generate synthetic OTEL spans (same methodology as 1TB dataset) | Configurable |
-        | `Dask_S3_Validation.ipynb` | Out-of-core Dask stress test with 30GB dataset | 30 GB |
+        | Notebook | Description |
+        |----------|-------------|
+        | `OTEL_Data_Generator.ipynb` | Synthetic OTEL spans → ``s3://$BUCKET/$PREFIX/spans/date=…/`` |
+        | `Dask_S3_Validation.ipynb` | Explicit LIST + distributed parquet (O(files) wall notes) |
+        | `Dask_S3_Workers_OneCell.ipynb` | Minimal hand-carry cell (s3fs+dask only, no project imports) |
+        | `HDF5_CPHY_Acquisition_Generator.ipynb` | CPHY HDF5 + Dask (idempotent; needs ``generate_hdf5.py``) |
+        | `HDF5_Iceberg_Metadata_Provider.ipynb` | ``hdf5_iceberg`` SDK metadata plane |
+
+        Sidecars on the same ConfigMap (also copied to ``/root``):
+
+        - ``generate_hdf5.py`` — imported by the CPHY HDF5 notebook
+        - ``cluster_env.py`` — S3/Dask config from JupyterHub env (no hard-coded secrets)
 
         ## Getting Started
 
-        These notebooks are **read-only** (mounted from ConfigMap). To edit and run:
+        JupyterLab home is ``/root`` (**writable**). Open top-level copies e.g.
+        ``/root/HDF5_CPHY_Acquisition_Generator.ipynb`` — not files inside
+        ``sample-notebooks/`` (RO ConfigMap; Duplicate → Errno 30).
 
-        ```bash
-        cp ~/sample-notebooks/OTEL_Data_Generator.ipynb ~/
-        ```
+        After converge/package updates the CM: **Stop My Server → Start My Server**
+        so startup re-seeds ``/root/*.ipynb`` and sidecars.
 
-        ## Environment Variables
+        HDF5 CPHY is **idempotent by default** (reuses S3 parts). Set
+        ``FORCE_REGENERATE = True`` / ``HDF5_FORCE_REGENERATE=1`` only for a full rewrite.
 
-        The following are pre-configured:
-        - `DASK_SCHEDULER_ADDRESS`: Dask cluster endpoint
-        - `S3_ENDPOINT`: S3 endpoint (if applicable)
-        - `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`: S3 credentials
+        ## Environment Variables (injected — no notebook edits)
+
+        From Zarf vars that **converge** passes (``--creds-file`` / ``S3_*``).
+        Local lab object store is **RustFS** (default keys ``admin``/``admin``).
+
+        - ``DASK_SCHEDULER_ADDRESS`` — ``tcp://…:8786`` (**do not** set ``DASK_SCHEDULER=tcp://…``;
+          dask treats that env as scheduler *type* and breaks ``dd.read_parquet`` planning)
+        - ``S3_ENDPOINT``, ``S3_BUCKET``, ``AWS_REGION`` / ``S3_REGION``
+        - ``AWS_ACCESS_KEY_ID`` / ``AWS_SECRET_ACCESS_KEY`` / ``AWS_SESSION_TOKEN``
+        - ``OTEL_DATA_PATH`` / ``OTEL_PREFIX`` — parquet under ``…/spans/``
+        - ``HDF5_PROFILE`` / ``HDF5_FORCE_REGENERATE`` / ``USE_DASK``
+
+        **Large data:** Dask on workers only. Do **not** ``pyarrow.dataset.to_table()``
+        multi‑GB sets in the kernel. Row counts: ``int(ddf.shape[0].compute())``,
+        never ``map_partitions(len).sum()`` (dask-expr).
 
         ## Cluster Resources
 
-        Default Dask cluster: 32 workers x 6 GiB = 192 GiB
+        Default package: ``DASK_WORKER_REPLICAS=4`` × 2 threads × 6 GiB.
+        Air-gap 2 TiB HDF5: raise workers (8–32). Prefer the DaskCluster CR:
 
-        To scale workers:
         ```bash
-        kubectl scale deployment cybersec-dask-default-worker -n dask --replicas=64
+        kubectl -n dask patch daskcluster cybersec-dask --type merge \
+          -p '{"spec":{"worker":{"replicas":8}}}'
+        ```
+
+        ## Rebuild / package
+
+        ```bash
+        python3 zarf/scripts/embed-notebooks.py   # regenerates ConfigMap YAML
+        python3 zarf/scripts/verify-sample-notebooks.py
+        # then: zarf package create (ops.sh package / devenv package task)
         ```
     """)
 
@@ -116,7 +157,7 @@ def main():
         "# DO NOT EDIT — regenerate with: python zarf/scripts/embed-notebooks.py",
         "#",
         "# Notebooks embedded from zarf/notebooks/",
-        "# Mounted read-only at /home/jovyan/sample-notebooks/ in JupyterHub",
+        "# Mounted read-only at ~/sample-notebooks/ ($HOME/sample-notebooks) in JupyterHub",
         "---",
         "apiVersion: v1",
         "kind: ConfigMap",
@@ -134,6 +175,23 @@ def main():
     for nb_name, nb_json in notebook_entries.items():
         yaml_parts.append(f"  {nb_name}: |")
         yaml_parts.append(yaml_block_scalar(nb_json))
+
+    # Ship generate_hdf5.py + cluster_env.py (ConfigMap mount → /root/sample-notebooks/)
+    if GENERATOR_SCRIPT.is_file():
+        gen_text = GENERATOR_SCRIPT.read_text()
+        yaml_parts.append("  generate_hdf5.py: |")
+        yaml_parts.append(yaml_block_scalar(gen_text))
+        print(f"  generate_hdf5.py: {len(gen_text):,} bytes")
+    else:
+        print(f"Warning: {GENERATOR_SCRIPT} not found — CPHY notebook import may fail", file=sys.stderr)
+
+    if CLUSTER_ENV_SCRIPT.is_file():
+        ce_text = CLUSTER_ENV_SCRIPT.read_text()
+        yaml_parts.append("  cluster_env.py: |")
+        yaml_parts.append(yaml_block_scalar(ce_text))
+        print(f"  cluster_env.py: {len(ce_text):,} bytes")
+    else:
+        print(f"Warning: {CLUSTER_ENV_SCRIPT} not found — notebooks use env fallback", file=sys.stderr)
 
     yaml_content = "\n".join(yaml_parts) + "\n"
 
@@ -153,7 +211,8 @@ def main():
         f.write(yaml_content)
 
     print(f"Wrote {OUTPUT_FILE}")
-    print(f"  README.md + {len(notebook_entries)} notebooks embedded")
+    extra = " + generate_hdf5.py" if GENERATOR_SCRIPT.is_file() else ""
+    print(f"  README.md + {len(notebook_entries)} notebooks{extra} embedded")
 
 
 if __name__ == "__main__":

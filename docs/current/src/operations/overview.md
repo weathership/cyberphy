@@ -44,7 +44,7 @@ OnDemand.retrieve -> OnDemand.audit
 #!/bin/bash
 # daily-health-check.sh
 
-echo "=== Cybersec Daily Health Check ==="
+echo "=== Cyberphy Daily Health Check ==="
 echo "Date: $(date)"
 echo
 

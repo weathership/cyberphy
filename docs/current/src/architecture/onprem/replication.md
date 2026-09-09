@@ -235,7 +235,7 @@ SELECT
   e.threat_score,
   e.ioc_match
 FROM cybersec.cloudtrail_events ct
-LEFT JOIN cybersec.local_enrichments e
+LEFT JOIN cyberphy.local_enrichments e
   ON ct.event_id = e.event_id;
 ```
 

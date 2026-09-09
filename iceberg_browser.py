@@ -29,6 +29,9 @@ app = Flask(__name__)
 # Service port mappings - maps service name to its port
 SERVICE_PORTS = {
     "flink": 8081,
+    # RustFS (local S3); minio_* keys retained as template aliases
+    "rustfs_console": 9011,
+    "rustfs_api": 9010,
     "minio_console": 9011,
     "minio_api": 9010,
     "polaris_api": 8181,
@@ -44,6 +47,25 @@ SERVICE_PORTS = {
     "dask": 30087,          # Dask Dashboard
     "jupyterhub": 30080,    # JupyterHub
     "k8s_dashboard": 10443, # Kubernetes Dashboard (HTTPS)
+}
+
+# Server-side health probe paths (host always 127.0.0.1 — hub proxies for UI dots)
+# Each entry: list of (path, accept_codes). First success wins.
+SERVICE_HEALTH_PROBES = {
+    "flink": [("/", {200, 301, 302})],
+    "rustfs_console": [("/rustfs/console/", {200, 301, 302, 401, 403})],
+    "rustfs_api": [("/health", {200}), ("/minio/health/live", {200})],
+    "minio_console": [("/rustfs/console/", {200, 301, 302, 401, 403})],
+    "minio_api": [("/health", {200}), ("/minio/health/live", {200})],
+    "nifi": [("/nifi/", {200, 301, 302, 401, 403})],
+    "prometheus": [("/-/healthy", {200}), ("/", {200})],
+    "polaris_admin": [("/q/health/ready", {200})],
+    # Catalog root often 404 without a path; any HTTP response means the listener is up
+    "polaris_api": [("/api/catalog/v1/config", {200, 401, 403}), ("/", {200, 401, 403, 404})],
+    "viz": [("/", {200, 301, 302, 401, 403})],
+    "dask": [("/health", {200}), ("/", {200, 301, 302})],
+    "jupyterhub": [("/hub/login", {200, 301, 302, 401, 403}), ("/", {200, 301, 302, 401, 403})],
+    "k8s_dashboard": [("/", {200, 301, 302, 401, 403})],
 }
 
 
@@ -105,11 +127,16 @@ def get_all_service_urls() -> dict:
     Returns:
         Dict mapping service names to their full URLs
     """
+    rustfs_console = get_service_url("rustfs_console", "/rustfs/console/")
+    rustfs_api = get_service_url("rustfs_api")
     return {
         "flink": get_service_url("flink"),
         "flink_ui": get_service_url("flink", "/#/overview"),
-        "minio_console": get_service_url("minio_console"),
-        "minio_api": get_service_url("minio_api"),
+        # RustFS console UI (release binary embeds assets at /rustfs/console/)
+        "rustfs_console": rustfs_console,
+        "rustfs_api": rustfs_api,
+        "minio_console": rustfs_console,  # template alias
+        "minio_api": rustfs_api,          # template alias
         "polaris_api": get_service_url("polaris_api"),
         "polaris_admin": get_service_url("polaris_admin"),
         "nifi": get_service_url("nifi", "/nifi"),
@@ -130,19 +157,30 @@ def inject_service_urls():
         "get_service_url": get_service_url,
     }
 
-# Iceberg catalog configuration - using REST catalog to connect to Polaris
-CATALOG_CONFIG = {
-    "type": "rest",
-    "uri": "http://localhost:8181/api/catalog",
-    "credential": "admin:admin",
-    "scope": "PRINCIPAL_ROLE:ALL",
-    "warehouse": "cybersec",
-    "s3.endpoint": "http://localhost:9010",
-    "s3.region": "us-east-1",
-    "s3.path-style-access": "true",
-    "s3.access-key-id": "minioadmin",
-    "s3.secret-access-key": "minioadmin",
-}
+# Iceberg catalog configuration - using REST catalog to connect to Polaris.
+# Defaults match devenv RustFS (admin/admin) + cyberphy catalog; env overrides.
+def _catalog_config() -> dict:
+    return {
+        "type": "rest",
+        "uri": os.environ.get("POLARIS_URI", "http://localhost:8181/api/catalog"),
+        "credential": os.environ.get("POLARIS_CREDENTIAL", "admin:admin"),
+        "scope": "PRINCIPAL_ROLE:ALL",
+        "warehouse": os.environ.get("POLARIS_CATALOG_NAME", "cyberphy"),
+        "s3.endpoint": os.environ.get("S3_ENDPOINT", "http://localhost:9010"),
+        "s3.region": os.environ.get("S3_REGION", "us-east-1"),
+        "s3.path-style-access": "true",
+        "s3.access-key-id": os.environ.get(
+            "AWS_ACCESS_KEY_ID",
+            os.environ.get("RUSTFS_ACCESS_KEY", os.environ.get("MINIO_ACCESS_KEY", "admin")),
+        ),
+        "s3.secret-access-key": os.environ.get(
+            "AWS_SECRET_ACCESS_KEY",
+            os.environ.get("RUSTFS_SECRET_KEY", os.environ.get("MINIO_SECRET_KEY", "admin")),
+        ),
+    }
+
+
+CATALOG_CONFIG = _catalog_config()
 
 # Global catalog instance (singleton to avoid re-initialization)
 _catalog = None
@@ -150,9 +188,11 @@ _catalog = None
 
 def get_catalog():
     """Get Iceberg catalog instance"""
-    global _catalog
+    global _catalog, CATALOG_CONFIG
     if _catalog is None:
-        _catalog = load_catalog("cybersec", **CATALOG_CONFIG)
+        CATALOG_CONFIG = _catalog_config()
+        warehouse = CATALOG_CONFIG.get("warehouse", "cyberphy")
+        _catalog = load_catalog(warehouse, **CATALOG_CONFIG)
     return _catalog
 
 
@@ -160,16 +200,18 @@ def get_table():
     """Load the preferred CloudTrail table from the catalog.
 
     Preference order matches the live datagen path:
-      1. cybersec.cloudtrail_events  (Polaris warehouse default)
-      2. default.cloudtrail_events
-      3. first table found in any namespace
+      1. cyberphy.cloudtrail_events  (Polaris warehouse default)
+      2. cybersec.cloudtrail_events  (legacy catalog name)
+      3. default.cloudtrail_events
+      4. first table found in any namespace
 
-    Distinguishes missing-table from broken warehouse (e.g. MinIO bucket gone /
+    Distinguishes missing-table from broken warehouse (e.g. S3 bucket gone /
     stale metadata) so API handlers can surface a useful error.
     """
     try:
         catalog = get_catalog()
         candidates = [
+            "cyberphy.cloudtrail_events",
             "cybersec.cloudtrail_events",
             "default.cloudtrail_events",
         ]
@@ -231,6 +273,63 @@ def api_service_urls():
         "base_host": get_base_host(),
         "services": get_all_service_urls(),
         "ports": SERVICE_PORTS,
+    })
+
+
+@app.route("/api/services/health")
+def api_services_health():
+    """Server-side probes for hub service-link status indicators.
+
+    Probes localhost ports so the browser does not hit CORS/NodePort issues.
+    Accepts 2xx/3xx/401/403 as "up" (auth walls still mean the service is live).
+    """
+    import urllib.error
+    import urllib.request
+
+    results = {}
+    for name, path_specs in SERVICE_HEALTH_PROBES.items():
+        port = SERVICE_PORTS.get(name)
+        if not port:
+            results[name] = {"up": False, "code": 0, "error": "unknown port"}
+            continue
+        scheme = "https" if name == "k8s_dashboard" else "http"
+        up = False
+        code = 0
+        err = None
+        for path, accept in path_specs:
+            url = f"{scheme}://127.0.0.1:{port}{path}"
+            try:
+                req = urllib.request.Request(url, method="GET")
+                open_kw = {"timeout": 2}
+                # Dashboard may use self-signed cert
+                if scheme == "https":
+                    import ssl
+                    open_kw["context"] = ssl._create_unverified_context()
+                with urllib.request.urlopen(req, **open_kw) as resp:
+                    code = getattr(resp, "status", 200) or 200
+                    if code in accept:
+                        up = True
+                        break
+            except urllib.error.HTTPError as e:
+                code = e.code
+                if code in accept:
+                    up = True
+                    break
+                err = f"HTTP {code}"
+            except Exception as e:
+                err = type(e).__name__
+                code = 0
+        results[name] = {"up": up, "code": code, "error": None if up else err}
+
+    # Aliases so data-service="minio_console" and "rustfs_console" both work
+    if "rustfs_console" in results and "minio_console" in results:
+        results["minio_console"] = results["rustfs_console"]
+    if "rustfs_api" in results and "minio_api" in results:
+        results["minio_api"] = results["rustfs_api"]
+
+    return jsonify({
+        "services": results,
+        "ts": datetime.utcnow().isoformat() + "Z",
     })
 
 
@@ -1296,13 +1395,15 @@ def bootstrap_info():
                 "flink_home": str(config.get_flink_home()) if config.get_flink_home() else None,
                 "flink_state": str(config.get_flink_state_dir()),
                 "minio_data": str(config.get_minio_data_dir()),
+                "rustfs_data": str(config.get_minio_data_dir()),
                 "log_dir": str(config.get_log_dir()),
             },
             "services": {
                 "postgres": {"host": config.postgres_host, "port": config.postgres_port},
                 "polaris": {"api_url": config.polaris_api_url, "admin_url": config.polaris_admin_url},
                 "flink": {"url": config.flink_url},
-                "minio": {"endpoint": config.minio_endpoint, "console": config.minio_console},
+                "rustfs": {"endpoint": config.minio_endpoint, "console": config.minio_console},
+                "minio": {"endpoint": config.minio_endpoint, "console": config.minio_console},  # alias
                 "iceberg_browser": {"port": config.iceberg_browser_port},
             },
             "catalog": {
@@ -2179,12 +2280,13 @@ if __name__ == "__main__":
     os.makedirs("templates", exist_ok=True)
     
     print("=" * 60)
-    print("Iceberg Browser - CloudTrail Events UI")
+    print("Cyberphy Hub - Iceberg Browser")
     print("=" * 60)
     print("Starting web server on http://localhost:5050")
     print("Make sure the following services are running:")
     print("  - PostgreSQL (localhost:5438)")
-    print("  - MinIO (localhost:9010)")
+    print("  - RustFS (localhost:9010 API / 9011 console)")
+    print("  - Polaris (localhost:8181 catalog / 8182 admin)")
     print("=" * 60)
     
     app.run(host="0.0.0.0", port=5050, debug=True)

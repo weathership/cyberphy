@@ -1,4 +1,4 @@
-# Cybersec Dask + OTEL Navigator image for air-gap deployment
+# Cyberphy Dask + OTEL Navigator image for air-gap deployment
 #
 # This image includes:
 # - All Python dependencies pre-installed (no runtime pip install)
@@ -8,8 +8,12 @@
 # - Numba JIT cache pre-compiled for fast startup
 #
 # Build (from project root):
-#   podman build -t cybersec-dask:2025.2.0 -f zarf/images/Dockerfile.cybersec-dask .
-#   docker build -t cybersec-dask:2025.2.0 -f zarf/images/Dockerfile.cybersec-dask .
+# Air-gap package image tag (must include h5py/hv — see requirements-airgap.txt):
+#   podman build -t localhost:5555/cybersec-dask:2025.2.0-notebook \
+#     -f zarf/images/Dockerfile.cybersec-dask .
+#   docker build -t localhost:5555/cybersec-dask:2025.2.0-notebook \
+#     -f zarf/images/Dockerfile.cybersec-dask .
+# Zarf package create expects: localhost:5555/cybersec-dask:2025.2.0-notebook
 #
 # Usage as Dask worker:
 #   docker run cybersec-dask:2025.2.0 dask-worker tcp://scheduler:8786
@@ -30,7 +34,7 @@ ARG BASE_IMAGE=ghcr.io/dask/dask:2025.2.0
 FROM ${BASE_IMAGE}
 
 # Metadata
-LABEL org.opencontainers.image.title="Cybersec Dask"
+LABEL org.opencontainers.image.title="Cyberphy Dask"
 LABEL org.opencontainers.image.description="Dask with OTEL Navigator for air-gap deployment"
 LABEL org.opencontainers.image.version="2025.2.0"
 LABEL org.opencontainers.image.source="https://github.com/cloudera/cybersec"
@@ -46,11 +50,19 @@ RUN pip install --no-cache-dir -r /tmp/requirements-airgap.txt && \
 # This avoids JIT compilation on first run in the cluster
 RUN python -c "import numba; numba.jit(nopython=True)(lambda x: x + 1)(1)" 2>/dev/null || true
 
-# Pre-import heavy libraries to verify installation and cache bytecode
-RUN python -c "import pandas; import numpy; import pyarrow; import holoviews; import datashader; import bokeh; import panel; import s3fs; import distributed; import colorcet; import grpc; import websockets; print('All dependencies imported successfully')"
+# Pre-import heavy libraries to verify installation and cache bytecode.
+# FAIL the build if notebook/air-gap deps are missing (no runtime pip).
+RUN python -c "\
+import pandas, numpy, pyarrow, holoviews, datashader, hvplot, bokeh, panel, \
+       s3fs, distributed, colorcet, grpc, websockets, h5py, numba, PIL, networkx; \
+print('All dependencies imported successfully'); \
+print('  holoviews', holoviews.__version__); \
+print('  datashader', datashader.__version__); \
+print('  h5py', h5py.__version__); \
+print('  dask-side distributed', distributed.__version__)"
 
 # Create app directory
-RUN mkdir -p /app /app/static/ghostty
+RUN mkdir -p /app /app/static/ghostty /app/lib
 
 # Copy OTEL Navigator + Data-View applications
 COPY zarf/images/otel-navigator.py /app/otel-navigator.py
@@ -58,9 +70,22 @@ COPY zarf/images/data_view_lib.py /app/data_view_lib.py
 COPY zarf/images/data-view.py /app/data-view.py
 # Streaming VPC flow generator (also used as a K8s workload entrypoint)
 COPY zarf/scripts/generate-vpc-flow.py /app/generate-vpc-flow.py
+# CPHY HDF5 generator at /app (and /app/lib) for PYTHONPATH imports.
+# Jupyter sample notebooks are NOT baked here as runnable .ipynb — they come from
+# the sample-notebooks ConfigMap at /root/sample-notebooks (writable home).
+# Baking .ipynb under WORKDIR /app caused users to open stale generate_parts cells.
+COPY zarf/scripts/generate_hdf5.py /app/generate_hdf5.py
+COPY zarf/scripts/generate_hdf5.py /app/lib/generate_hdf5.py
 
-# Copy sample notebooks for JupyterHub users
-COPY zarf/images/sample-notebooks/ /app/sample-notebooks/
+# Standalone hdf5_iceberg SDK (import: from hdf5_iceberg import …) — not under cybersec/
+COPY packages/hdf5_iceberg/src/hdf5_iceberg /app/hdf5_iceberg
+
+# Pointer only under /app/sample-notebooks (avoids stale notebooks in File browser)
+RUN mkdir -p /app/sample-notebooks && printf '%s\n' \
+  'Sample notebooks are served from the ConfigMap at /root/sample-notebooks.' \
+  'Copy into home before editing:' \
+  '  cp /root/sample-notebooks/HDF5_CPHY_Acquisition_Generator.ipynb /root/' \
+  > /app/sample-notebooks/README.md
 
 # Copy NavigatorEngine + PTY proxy packages (M2)
 COPY cybersec/__init__.py /app/cybersec/__init__.py
@@ -109,12 +134,17 @@ COPY zarf/images/loader.js /app/static/ghostty/loader.js
 RUN python -c "import ast; ast.parse(open('/app/otel-navigator.py').read()); print('App syntax OK')"
 RUN python -c "import ast; ast.parse(open('/app/data-view.py').read()); print('Data-View syntax OK')"
 RUN python -c "import ast; ast.parse(open('/app/generate-vpc-flow.py').read()); print('VPC flow generator syntax OK')"
+RUN python -c "import ast; ast.parse(open('/app/generate_hdf5.py').read()); print('HDF5 generator syntax OK')"
 RUN PYTHONPATH=/app python -c "from cybersec.engine.service import NavigatorEngineServicer; from cybersec.pty_proxy.repl import NavigatorREPL; print('Engine + PTY proxy imports OK')"
+# Smoke: generator module loads (imports h5py/numpy only; no network)
+RUN PYTHONPATH=/app python -c "import generate_hdf5 as gh; assert 'lab' in gh.PROFILES; print('generate_hdf5 profiles:', list(gh.PROFILES))"
 
-# Set environment variables for Dask
+# Set environment variables for Dask + notebook imports
 ENV DASK_DISTRIBUTED__WORKER__MEMORY__SPILL="0.85"
 ENV DASK_DISTRIBUTED__WORKER__MEMORY__TARGET="0.75"
 ENV DASK_DISTRIBUTED__WORKER__MEMORY__TERMINATE="0.95"
+# /app first so `import generate_hdf5` works from notebooks without cwd tricks
+ENV PYTHONPATH="/app:${PYTHONPATH}"
 
 # Default working directory
 WORKDIR /app

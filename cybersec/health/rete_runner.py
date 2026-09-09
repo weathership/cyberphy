@@ -356,11 +356,19 @@ class ReteHealthRunner:
 
         self.engine.assert_fact(Fact("service", "postgres", healthy=healthy, port=ctx.postgres_port))
 
-        # MinIO
+        # Local S3 (RustFS; fact name remains "minio" for rete compatibility)
+        healthy = False
         try:
+            base = ctx.minio_endpoint.rstrip("/")
             async with httpx.AsyncClient(timeout=5.0) as client:
-                resp = await client.get(f"{ctx.minio_endpoint}/minio/health/live")
-                healthy = resp.status_code == 200
+                for path in ("/health", "/minio/health/live"):
+                    try:
+                        resp = await client.get(f"{base}{path}")
+                        if resp.status_code == 200:
+                            healthy = True
+                            break
+                    except Exception:
+                        continue
         except Exception:
             healthy = False
 

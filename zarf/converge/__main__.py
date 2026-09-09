@@ -34,7 +34,7 @@ def _default_zarf() -> str | None:
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(
-        prog="converge", description="cybersec-dask deployment convergence engine")
+        prog="converge", description="cyberphy (cybersec-dask package) deployment convergence engine")
     mode = ap.add_mutually_exclusive_group()
     mode.add_argument("--apply", action="store_true", help="remediate to a fixpoint")
     mode.add_argument("--verify", action="store_true", help="assert target state (oracle); no changes")
@@ -78,6 +78,12 @@ def main(argv=None) -> int:
                 line = line.strip()
                 if line and not line.startswith("#") and "=" in line:
                     k, v = line.split("=", 1)
+                    # Operators write these files shell-style; tolerate quoted
+                    # values (field 2026-07-29: S3_BUCKET='dhfo' became a
+                    # literal-quoted bucket name and a false FAIL drift).
+                    v = v.strip()
+                    if len(v) >= 2 and v[0] == v[-1] and v[0] in "'\"":
+                        v = v[1:-1]
                     s3[k.strip()] = v
         except OSError as e:
             print(f"FATAL: --creds-file unreadable: {e}", file=sys.stderr)

@@ -22,13 +22,23 @@ import os
 import re
 import stat
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 from .discovery import APP_NAMESPACES, DASK_CRD_KINDS
-from .kube import Ctx
+from .kube import Ctx, _mem_to_gib
 from .model import Cost, Fix, Invariant, Layer, Probe
 from . import manual as _manual
 from . import platform as _platform
+
+# Package defaults (zarf.yaml) — used when env is unset on first deploy / capacity math.
+_WORKER_DEFAULT_REPLICAS = 4
+_WORKER_DEFAULT_NTHREADS = "2"
+_WORKER_DEFAULT_CPU = "2"
+_WORKER_DEFAULT_MEMORY = "6Gi"
+_WORKER_DEFAULT_MEM_REQUEST = "2Gi"
+# Reserve RAM for kubelet + system + scheduler + panel + hub so workers do not
+# strand otel-navigator. Capacity target = floor((total − headroom) / worker_mem).
+_WORKER_MEM_HEADROOM_GIB = 8.0
 
 # Registry hostPath — non-root registry container; fsGroup does NOT chown hostPath.
 REGISTRY_HOSTPATH = "/var/lib/zarf-registry"
@@ -496,10 +506,156 @@ _S3_SECRET_KEYS = {"S3_ACCESS_KEY", "S3_SECRET_KEY", "S3_SESSION_TOKEN"}
 _S3_DEPENDENT_COMPONENTS = ("panel-viz", "navigator-engine")
 
 
+def _zarf_deploy_retries(components: str) -> int:
+    """Zarf ``--retries`` — permanent failures (OOM, ImagePull) must not burn 10×.
+
+    converge-24/25: navigator-engine OOM drove ``--retries 10`` + 7200s wall with
+    no progress visibility. Prefer few retries; engine rem/abort handles terminal.
+    """
+    c = {x.strip() for x in components.lower().split(",") if x.strip()}
+    heavy = {"jupyterhub", "sample-notebooks", "dask-operator", "dask-cluster"}
+    if c & heavy:
+        return 3
+    if "cybersec-images" in c:
+        return 3
+    # Light chart-only redeploys (engine/panel already imaged)
+    return 2
+
+
+def _zarf_deploy_timeout(components: str) -> int:
+    """Seconds for ``zarf package deploy --components=…`` wall-clock kill.
+
+    Scaled down from blanket 7200s (converge-24). Heavy sets still get room for
+    air-gap image push + helm; light remediations fail fast and re-detect.
+    """
+    c = components.lower()
+    if any(x in c for x in ("jupyterhub", "sample-notebooks")):
+        return 3600  # hub chart is the slow path
+    if any(x in c for x in ("dask-operator", "dask-cluster")):
+        return 2400
+    if "cybersec-images" in c:
+        # Push can be long on first install; registry already populated → abort
+        # check / early success short-circuits well under this.
+        return 1800
+    if any(x in c for x in ("panel-viz", "navigator-engine")):
+        return 900
+    return 1200
+
+
+def _deploy_abort_signal(ctx: Ctx, components: str, *, started: float) -> Optional[str]:
+    """Return a short reason to kill an in-flight zarf deploy, or None.
+
+    Only arms after a grace period so we do not abort before pods are created.
+    """
+    import time as _time
+    if _time.monotonic() - started < 45.0:
+        return None
+    c = components.lower()
+    watch: List[tuple] = []  # (ns, selector, label)
+    if any(x in c for x in ("panel-viz", "cybersec-images")):
+        watch.append((_PANEL_NS, "app=otel-navigator", "otel-navigator"))
+    if any(x in c for x in ("navigator-engine", "cybersec-images")):
+        watch.append((_PANEL_NS, "app=navigator-engine", "navigator-engine"))
+    if any(x in c for x in ("dask-cluster", "dask-operator", "cybersec-images")):
+        watch.append(("dask", "dask.org/component=scheduler", "dask-scheduler"))
+    for ns, sel, label in watch:
+        for p in ctx.items("pods", ns=ns, selector=sel):
+            for cs in ((p.get("status") or {}).get("containerStatuses") or []):
+                waiting = ((cs.get("state") or {}).get("waiting") or {})
+                reason = waiting.get("reason") or ""
+                if reason in _IMAGE_WAIT_BAD:
+                    return f"{label} {reason} mid-deploy — fix images, not more zarf retries"
+                if reason == "CrashLoopBackOff":
+                    last = ((cs.get("lastState") or {}).get("terminated") or {})
+                    if last.get("reason") == "OOMKilled":
+                        return (f"{label} CrashLoop/OOM mid-deploy — raise memory "
+                                f"limits (not zarf retries)")
+    return None
+
+
+def _pre_deploy_feasibility(ctx: Ctx, components: str) -> List[str]:
+    """Knowable preconditions for package deploys that embed hard waits.
+
+    Converge-09 class: committing to ``dask-cluster`` while the scheduler is
+    already Pending/not Ready under pressure converts a long deploy into a
+    guaranteed after-action timeout and mints a failed helm revision.
+    """
+    issues: List[str] = []
+    c = components.lower()
+    node = _node_schedulability_census(ctx)
+    if not node["schedulable"]:
+        issues.append(f"node not schedulable: {node['summary']}")
+    issues.extend(_disk_pressure_issues(ctx))
+    # Components with in-package Ready waits (zarf.yaml after actions)
+    # Registry v2 is SoR for pullability (alongside kubectl / helm secrets).
+    reg = _registry_census(ctx)
+    if any(x in c for x in (
+        "cybersec-images", "dask-cluster", "dask-operator",
+        "jupyterhub", "panel-viz", "navigator-engine",
+    )):
+        if reg.get("registry_ready", 0) < 1 and reg.get("registry_total", 0) > 0:
+            issues.append("zarf registry pods not Ready")
+        if reg.get("catalog_has_app") is False:
+            issues.append("registry catalog missing cybersec-dask — push images first")
+        if reg.get("partial_push"):
+            issues.append(
+                f"registry PARTIAL_PUSH for cybersec-dask:{reg.get('target_tag')} "
+                f"(catalog has repo, manifest HEAD 404) — re-push cybersec-images "
+                f"before deploy that would ImagePullBackOff"
+            )
+        elif reg.get("manifest_ok") is False and reg.get("target_tag"):
+            issues.append(
+                f"registry missing pullable manifest cybersec-dask:{reg.get('target_tag')} "
+                f"— push cybersec-images first"
+            )
+    if any(x in c for x in ("dask-cluster", "dask-operator")):
+        sched = _pod_terminal_census(ctx, "dask", "dask.org/component=scheduler")
+        if "dask-cluster" in c and sched["pending"] and not node["schedulable"]:
+            issues.append(
+                "scheduler already Pending and node not schedulable — "
+                "resolve schedule before dask-cluster deploy (embedded wait)"
+            )
+        if "dask-cluster" in c and sched["image_pull"]:
+            issues.append(
+                f"scheduler ImagePull before deploy: {sched['image_pull'][:2]} — "
+                "push cybersec-images first"
+            )
+    return issues
+
+
 def _zarf_deploy_components(ctx: Ctx, components: str) -> Fix:
-    if not (ctx.have_zarf() and ctx.package_path):
-        reason = "zarf binary and/or package tarball not available to this engine instance"
+    missing = []
+    if not ctx.have_zarf():
+        missing.append(f"zarf binary missing (zarf_bin={ctx.zarf_bin!r})")
+    if not ctx.package_path:
+        missing.append("package path not passed to engine (--package / converge-node.sh arg)")
+    elif not Path(ctx.package_path).is_file():
+        missing.append(f"package file not found: {ctx.package_path}")
+    if missing:
+        reason = "; ".join(missing)
         return Fix(False, _manual.zarf_deploy_manual_line(components, reason=reason))
+    # Refuse long zarf deploys under disk pressure unless FSM can resolve it:
+    # df >= hard → clear taint + wait for condition; df < hard → MANUAL free disk.
+    dp = _disk_pressure_issues(ctx)
+    if dp:
+        resolved = _platform.rem_resolve_disk_pressure(ctx)
+        if not resolved.changed and _disk_pressure_issues(ctx):
+            return Fix(False, _manual.join_detail(
+                f"refusing zarf deploy --components={components} — "
+                f"{resolved.detail}",
+                _manual.hint_for("T0.no-disk-pressure"),
+            ))
+        # Pressure cleared — fall through to deploy
+        print(f"    disk pressure resolved: {resolved.detail}", flush=True)
+    # Feasibility from *live* API/registry/node state only (no out-of-band journal).
+    # Converge-09 class: refuse deploys whose embedded waits are already doomed.
+    feas = _pre_deploy_feasibility(ctx, components)
+    if feas:
+        return Fix(False, _manual.join_detail(
+            f"refusing zarf deploy --components={components} — pre-deploy feasibility "
+            f"failed: {'; '.join(feas)}",
+            _manual.zarf_deploy_recipe(components),
+        ))
     # Fail LOUD rather than render an empty S3_BUCKET. An S3-dependent component
     # deployed with a blank bucket renders OTEL_DATA_PATH=s3:/// and bricks the app
     # ("Invalid bucket name 's3:'"), so refuse instead of silently breaking it.
@@ -515,15 +671,25 @@ def _zarf_deploy_components(ctx: Ctx, components: str) -> Fix:
     # Unwind deploy-blocking wedges BEFORE zarf. Stamp detected INGRESS_CLASS so
     # redeploys never re-introduce traefik-on-RKE2 silent 404s.
     _platform.ensure_ingress_class_in_ctx(ctx)
-    # Default resilient worker count if unset (package default may be multi-node).
-    if not ctx.s3.get("DASK_WORKER_REPLICAS"):
-        ctx.s3["DASK_WORKER_REPLICAS"] = "1"
+    # Worker sizing for package templates (canonical names). Aliases folded first;
+    # T4.workers-capacity still capacity-caps and surgically patches a live CR.
+    _normalize_worker_aliases(ctx)
+    if not _s3_lookup(ctx, "DASK_WORKER_REPLICAS"):
+        # Multi-core lab / air-gap baseline; capacity cap (T4) still trims Pending
+        ctx.s3["DASK_WORKER_REPLICAS"] = str(_WORKER_DEFAULT_REPLICAS)
+    if not _s3_lookup(ctx, "DASK_WORKER_NTHREADS"):
+        ctx.s3["DASK_WORKER_NTHREADS"] = _WORKER_DEFAULT_NTHREADS
+    if not _s3_lookup(ctx, "DASK_WORKER_CPU"):
+        ctx.s3["DASK_WORKER_CPU"] = _WORKER_DEFAULT_CPU
+    if not _s3_lookup(ctx, "DASK_WORKER_MEMORY"):
+        ctx.s3["DASK_WORKER_MEMORY"] = _WORKER_DEFAULT_MEMORY
     unwound = (_unwedge_pending_helm(ctx) + _unwedge_terminating_app_ns(ctx)
                + _strip_agent_ignore(ctx) + _unwedge_unmutated_pods(ctx)
                + _unwedge_broken_dask_cluster(ctx))
     pre = f"  [unwound: {'; '.join(unwound)}]" if unwound else ""
+    retries = _zarf_deploy_retries(components)
     args = ["package", "deploy", ctx.package_path, "--confirm",
-            f"--components={components}", "--retries", "10"]
+            f"--components={components}", "--retries", str(retries)]
     if not ctx.registry_pvc_enabled:
         args.append("--set-variables=REGISTRY_PVC_ENABLED=false")
     # Non-sensitive vars → --set-variables; secrets → ZARF_CONFIG tmpfs.
@@ -547,8 +713,24 @@ def _zarf_deploy_components(ctx: Ctx, components: str) -> Fix:
                 esc = v.replace("\\", "\\\\").replace('"', '\\"')
                 f.write(f'{k} = "{esc}"\n')
         env["ZARF_CONFIG"] = cfg_path
+    deploy_timeout = _zarf_deploy_timeout(components)
+    print(
+        f"    $ zarf {' '.join(args)}  (timeout={deploy_timeout}s retries={retries} stream+abort)",
+        flush=True,
+    )
+    import time as _time
+    t0 = _time.monotonic()
+
+    def _abort() -> Optional[str]:
+        return _deploy_abort_signal(ctx, components, started=t0)
+
     try:
-        r = ctx.zarf(args, env=env)
+        # Stream zarf so progress is visible; abort on terminal cluster signals
+        # (ImagePull/OOM loop) instead of burning the full wall-clock (converge-24).
+        r = ctx.zarf_stream(
+            args, env=env, timeout=deploy_timeout,
+            abort_check=_abort, abort_every=12.0,
+        )
 
         # DEAD HELM RELEASE — field-proven (2026-07-15): a chart whose FIRST install
         # failed leaves a release with only `failed` revisions; every later
@@ -558,7 +740,8 @@ def _zarf_deploy_components(ctx: Ctx, components: str) -> Fix:
         # this state (status `failed`, not pending-*). Remedy is zarf's own
         # recommendation: `zarf package remove` the failing COMPONENT (named in the
         # error), then a fresh deploy INSTALLS instead of upgrading. One retry.
-        err = (r.stderr or "") + (r.stdout or "")
+        # Normalize streams: TimeoutExpired / some zarf builds can leave bytes.
+        err = Ctx.out_text(r.stderr) + Ctx.out_text(r.stdout)
         if r.returncode != 0 and "no deployed releases" in err and ctx.package_path:
             # Parse component name whether zarf quotes with " or '.
             m = re.search(
@@ -584,7 +767,10 @@ def _zarf_deploy_components(ctx: Ctx, components: str) -> Fix:
                 f"removed dead-release component(s) [{', '.join(notes)}] "
                 f"(helm 'has no deployed releases')"
             )
-            r2 = ctx.zarf(args, env=env)
+            r2 = ctx.zarf_stream(
+                args, env=env, timeout=deploy_timeout,
+                abort_check=_abort, abort_every=12.0,
+            )
             if r2.returncode == 0:
                 return Fix(True, f"zarf deploy {components}: rc=0 "
                                  f"(retry after dead-release removal)  [{note}]{pre}")
@@ -604,7 +790,9 @@ def _zarf_deploy_components(ctx: Ctx, components: str) -> Fix:
     # carry the cause (chart timeout, image pull, CRD hook); S3 secrets ride env, not
     # stdout, so this stays clean. Always attach in-situ DISCOVER/FIX so operators can
     # re-run the same ``zarf package deploy --components=…`` that unblocks installs.
-    tail = (r.stderr or r.stdout or "").strip().splitlines()[-3:]
+    # Failure leaves *cluster* evidence (helm failed-with-history, Pending pods,
+    # Deployment available=0) — next discover() reads that API state, not a journal.
+    tail = (Ctx.out_text(r.stderr) or Ctx.out_text(r.stdout)).strip().splitlines()[-3:]
     suffix = f" — {' / '.join(s.strip() for s in tail)}" if tail else ""
     head = f"zarf deploy {components}: rc={r.returncode}{suffix}{pre}"
     return Fix(False, _manual.join_detail(
@@ -712,14 +900,381 @@ def _rem_node_ready(ctx: Ctx) -> Fix:
     return Fix(changed, "uncordoned cordoned node(s)" if changed else "nothing to uncordon")
 
 
-def _det_no_disk_pressure(ctx: Ctx) -> Probe:
-    tainted = []
+def _disk_pressure_issues(ctx: Ctx) -> List[str]:
+    """Node DiskPressure *condition* and/or disk-pressure *taint*.
+
+    Field: operators may ``kubectl taint … disk-pressure-`` while the condition is
+    still True — kubelet re-taints and pods stay unschedulable. Long zarf deploys
+    under DiskPressure=True fill imagefs further and wedge hub/proxy Pending.
+    """
+    issues: List[str] = []
     for n in ctx.items("nodes"):
+        name = (n.get("metadata") or {}).get("name") or "?"
+        conds = {c.get("type"): c for c in (n.get("status") or {}).get("conditions") or []}
+        dp = conds.get("DiskPressure") or {}
+        if str(dp.get("status", "")).lower() == "true":
+            msg = (dp.get("message") or dp.get("reason") or "DiskPressure=True").strip()
+            issues.append(f"{name}: condition DiskPressure=True ({msg})")
         for t in n.get("spec", {}).get("taints", []) or []:
             if t.get("key") == "node.kubernetes.io/disk-pressure":
-                tainted.append(n["metadata"]["name"])
-    return Probe(not tainted, f"disk-pressure on {tainted}" if tainted
-                 else "no disk-pressure taint")
+                effect = t.get("effect") or "NoSchedule"
+                issues.append(f"{name}: taint node.kubernetes.io/disk-pressure:{effect}")
+    return issues
+
+
+def _det_no_disk_pressure(ctx: Ctx) -> Probe:
+    """DiskPressure vs df floors — NoSchedule taint is the scheduling gate.
+
+    When free >= soft and only the condition bit is sticky (no disk-pressure
+    taint), treat as OK so rem does not block multi-minute waits (converge-19).
+    """
+    issues = _disk_pressure_issues(ctx)
+    free = _platform.disk_free_census()
+    min_free = free.get("min_free_gib")
+    soft = free.get("soft_gib")
+    hard = free.get("hard_gib")
+    if free.get("below_hard"):
+        return Probe(
+            False,
+            f"df below hard eviction floor (min_free={min_free}Gi < hard={hard}Gi); "
+            f"{free['summary']}",
+        )
+    # Any disk-pressure NoSchedule taint → not OK (pods cannot schedule)
+    taint_only = [i for i in issues if "disk-pressure taint" in i or "NoSchedule" in i]
+    cond_only = [i for i in issues if "DiskPressure=True" in i or "condition DiskPressure" in i]
+    if taint_only:
+        detail = "; ".join(taint_only + ([free["summary"]] if free.get("summary") else []))
+        if min_free is not None and soft is not None and float(min_free) >= float(soft):
+            detail += f" — df >= soft ({soft}Gi); rem will clear taint without long wait"
+        elif issues and not free.get("below_hard"):
+            detail += f" — df above hard; rem will clear taint / short-wait"
+        return Probe(False, detail)
+    # Condition True but no taint: if df >= soft, scheduling works — OK
+    if cond_only and min_free is not None and soft is not None \
+            and float(min_free) >= float(soft):
+        return Probe(
+            True,
+            f"DiskPressure condition lag with df >= soft ({free['summary']}) — "
+            f"no NoSchedule taint; not blocking",
+        )
+    if not issues and not free.get("below_hard"):
+        return Probe(True, f"no DiskPressure; {free['summary']}")
+    detail_parts = list(issues) if issues else []
+    if issues:
+        detail_parts.append(free["summary"])
+    return Probe(False, "; ".join(detail_parts) if detail_parts else free["summary"])
+
+
+def _rem_no_disk_pressure(ctx: Ctx) -> Fix:
+    """See platform.rem_resolve_disk_pressure — MANUAL only when df < hard GiB."""
+    return _platform.rem_resolve_disk_pressure(ctx)
+
+
+def _node_schedulability_census(ctx: Ctx) -> dict:
+    """Single-node (or multi) knowable schedulability: Ready, pressure, taints, cordon.
+
+    Air-gap single-node field path: DiskPressure/MemoryPressure and imagefs pressure
+    explain almost all Pending after a successful package apply (wait actions timeout
+    while pods cannot schedule). No external APIs — pure kubectl inventory.
+    """
+    blockers: List[str] = []
+    notes: List[str] = []
+    schedulable = True
+    for n in ctx.items("nodes"):
+        name = (n.get("metadata") or {}).get("name") or "?"
+        conds = {c.get("type"): c for c in (n.get("status") or {}).get("conditions") or []}
+        ready = str((conds.get("Ready") or {}).get("status", "")).lower() == "true"
+        if not ready:
+            blockers.append(f"{name}: NotReady")
+            schedulable = False
+        for ptype in ("DiskPressure", "MemoryPressure", "PIDPressure"):
+            c = conds.get(ptype) or {}
+            if str(c.get("status", "")).lower() == "true":
+                msg = (c.get("message") or c.get("reason") or ptype).strip()
+                blockers.append(f"{name}: {ptype}=True ({msg})")
+                schedulable = False
+        if n.get("spec", {}).get("unschedulable"):
+            blockers.append(f"{name}: cordoned")
+            schedulable = False
+        for t in n.get("spec", {}).get("taints", []) or []:
+            key = t.get("key") or ""
+            effect = t.get("effect") or ""
+            if effect not in ("NoSchedule", "NoExecute"):
+                continue
+            if "control-plane" in key or "master" in key:
+                notes.append(f"{name}: system taint {key}:{effect} (tolerated by system pods)")
+                continue
+            blockers.append(f"{name}: taint {key}:{effect}")
+            if any(x in key for x in (
+                "disk-pressure", "memory-pressure", "pid-pressure",
+                "unreachable", "not-ready", "unschedulable",
+            )):
+                schedulable = False
+        # Allocatable vs capacity (informational)
+        alloc = (n.get("status") or {}).get("allocatable") or {}
+        if alloc.get("memory"):
+            notes.append(f"{name}: allocatable mem={alloc.get('memory')} cpu={alloc.get('cpu')}")
+    return {
+        "schedulable": schedulable,
+        "blockers": blockers,
+        "notes": notes,
+        "disk_pressure": any("DiskPressure" in b for b in blockers),
+        "summary": (
+            "node_schedulable=True" if schedulable
+            else "node_schedulable=False [" + "; ".join(blockers[:5]) + "]"
+        ),
+    }
+
+
+def _pod_failed_scheduling_msgs(pod: dict) -> List[str]:
+    """Extract FailedScheduling / wait reasons from pod status (knowable locally)."""
+    msgs: List[str] = []
+    st = pod.get("status") or {}
+    for c in st.get("conditions") or []:
+        if c.get("type") == "PodScheduled" and c.get("status") == "False":
+            reason = c.get("reason") or "Unschedulable"
+            msg = (c.get("message") or "").strip()
+            msgs.append(f"{reason}: {msg}" if msg else reason)
+    for cs in (st.get("containerStatuses") or []) + (st.get("initContainerStatuses") or []):
+        waiting = ((cs.get("state") or {}).get("waiting") or {})
+        if waiting.get("reason"):
+            wmsg = (waiting.get("message") or "").strip()
+            msgs.append(
+                f"{waiting.get('reason')}"
+                + (f": {wmsg[:160]}" if wmsg else "")
+            )
+        term = ((cs.get("state") or {}).get("terminated") or {})
+        if term.get("reason") in ("OOMKilled", "Error"):
+            msgs.append(f"terminated:{term.get('reason')}")
+    return msgs
+
+
+def _pod_terminal_census(ctx: Ctx, ns: str, selector: str) -> dict:
+    """Census one workload: phases, FailedScheduling, ImagePull, CrashLoop, images."""
+    pods = ctx.items("pods", ns=ns, selector=selector)
+    ready, total = ctx.pods_ready(ns, selector)
+    pending: List[dict] = []
+    image_pull: List[str] = []
+    crash: List[str] = []
+    images: List[str] = []
+    _PULL = ("ImagePullBackOff", "ErrImagePull", "ErrImageNeverPull")
+    _CRASH = ("CrashLoopBackOff", "CreateContainerConfigError",
+              "RunContainerError", "OOMKilled")
+    for p in pods:
+        name = (p.get("metadata") or {}).get("name") or "?"
+        phase = (p.get("status") or {}).get("phase") or "?"
+        node = (p.get("spec") or {}).get("nodeName") or ""
+        msgs = _pod_failed_scheduling_msgs(p)
+        for m in msgs:
+            low = m.lower()
+            if any(x.lower() in low for x in _PULL):
+                image_pull.append(f"{name}:{m[:100]}")
+            if any(x.lower() in low for x in _CRASH) or "oomkilled" in low:
+                crash.append(f"{name}:{m[:100]}")
+        for c in (p.get("spec") or {}).get("containers") or []:
+            img = c.get("image") or ""
+            if img and img not in images:
+                images.append(img)
+        if phase == "Pending" or not node:
+            pending.append({
+                "name": name, "phase": phase, "node": node or None, "msgs": msgs,
+            })
+    return {
+        "ready": ready,
+        "total": total,
+        "pending": pending,
+        "image_pull": image_pull,
+        "crash": crash,
+        "images": images,
+        "summary": (
+            f"{ns}/{selector}: ready={ready}/{total} pending={len(pending)} "
+            f"image_pull={len(image_pull)} crash={len(crash)}"
+        ),
+    }
+
+
+def _registry_v2_bases(ctx: Ctx) -> List[str]:
+    """In-cluster registry HTTP bases (distribution v2) — part of the SoR set.
+
+    Prefer ClusterIP/NodePort of zarf-docker-registry; fall back to common NodePort.
+    Fully in-cluster; no external registry.
+    """
+    bases: List[str] = []
+    svc = (
+        ctx.get("svc", "zarf-docker-registry", ns=ZARF_NS)
+        or ctx.get("service", "zarf-docker-registry", ns=ZARF_NS)
+    )
+    if svc:
+        spec = svc.get("spec") or {}
+        ports = spec.get("ports") or []
+        port = 5000
+        for p in ports:
+            if p.get("name") in ("http", "registry", None) or p.get("port"):
+                port = int(p.get("port") or 5000)
+                np = p.get("nodePort")
+                if np:
+                    bases.append(f"http://127.0.0.1:{int(np)}")
+                break
+        cip = spec.get("clusterIP")
+        if cip and cip not in ("None", "none", ""):
+            bases.append(f"http://{cip}:{port}")
+    # Common zarf internal registry NodePort on single-node RKE2
+    for np in (31999, 30001):
+        b = f"http://127.0.0.1:{np}"
+        if b not in bases:
+            bases.append(b)
+    return bases
+
+
+def _registry_manifest_head(ctx: Ctx, repo: str, tag: str) -> dict:
+    """HEAD /v2/<repo>/manifests/<tag> against the zarf registry.
+
+    Distinguishes:
+      * 200 — manifest present (pullable)
+      * 404 — tag/manifest missing (partial push if catalog lists repo)
+      * 401/403 — auth; treat as unknown (not a false partial)
+      * other/unreachable — unknown
+
+    This is the only in-cluster place "blobs present, manifest absent" is knowable.
+    """
+    import urllib.error
+    import urllib.request
+
+    if not tag or not repo:
+        return {"ok": None, "status": None, "detail": "no target tag/repo"}
+    path = f"/v2/{repo}/manifests/{tag}"
+    accept = (
+        "application/vnd.docker.distribution.manifest.v2+json,"
+        "application/vnd.oci.image.manifest.v1+json,"
+        "application/vnd.docker.distribution.manifest.list.v2+json"
+    )
+    last_err = ""
+    for base in _registry_v2_bases(ctx):
+        url = base.rstrip("/") + path
+        try:
+            req = urllib.request.Request(
+                url, method="HEAD",
+                headers={"Accept": accept},
+            )
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                code = getattr(resp, "status", None) or resp.getcode()
+                if code == 200:
+                    return {
+                        "ok": True,
+                        "status": 200,
+                        "detail": f"manifest HEAD 200 {repo}:{tag} via {base}",
+                        "base": base,
+                    }
+                last_err = f"{base} → HTTP {code}"
+        except urllib.error.HTTPError as e:
+            if e.code == 200:
+                return {
+                    "ok": True, "status": 200,
+                    "detail": f"manifest HEAD 200 {repo}:{tag} via {base}",
+                    "base": base,
+                }
+            if e.code == 404:
+                return {
+                    "ok": False,
+                    "status": 404,
+                    "detail": (
+                        f"manifest HEAD 404 {repo}:{tag} via {base} — "
+                        f"tag not pullable (partial push or never pushed)"
+                    ),
+                    "base": base,
+                }
+            if e.code in (401, 403):
+                return {
+                    "ok": None,
+                    "status": e.code,
+                    "detail": f"manifest HEAD {e.code} (auth) via {base} — unknown",
+                    "base": base,
+                }
+            last_err = f"{base} → HTTP {e.code}"
+        except Exception as e:  # noqa: BLE001 — census best-effort
+            last_err = f"{base} → {type(e).__name__}: {e}"
+            continue
+    return {
+        "ok": None,
+        "status": None,
+        "detail": f"manifest HEAD unreachable ({last_err})",
+    }
+
+
+def _registry_census(ctx: Ctx) -> dict:
+    """Knowable Layer-A registry state (in-cluster SoR alongside kubectl/helm secrets).
+
+    - registry Deployment pods Ready
+    - ``zarf tools registry catalog`` lists cybersec-dask (repo presence)
+    - distribution v2 HEAD of the *package target tag* (manifest pullable)
+
+    Catalog-has-repo + HEAD 404 ⇒ partial push — the state that survives a
+    feasibility probe based only on catalog and then ImagePullBackOffs on deploy.
+    """
+    reg_ready, reg_total = ctx.pods_ready(ZARF_NS, "app=docker-registry")
+    if reg_total == 0:
+        reg_ready, reg_total = ctx.pods_ready(ZARF_NS, "app.kubernetes.io/name=docker-registry")
+    catalog_ok = None  # None = unknown, True/False known
+    catalog_detail = ""
+    if ctx.have_zarf():
+        r = ctx.zarf(["tools", "registry", "catalog"], timeout=60)
+        out = Ctx.out_text(r.stdout) + Ctx.out_text(r.stderr)
+        if r.returncode == 0:
+            catalog_ok = "cybersec-dask" in out
+            catalog_detail = (
+                "catalog has cybersec-dask" if catalog_ok
+                else "catalog reachable; cybersec-dask absent"
+            )
+        else:
+            catalog_detail = f"catalog query rc={r.returncode}"
+
+    tag = _target_cybersec_tag(ctx)
+    # _target_cybersec_tag is defined later in this module — available at runtime
+    manifest = _registry_manifest_head(ctx, "cybersec-dask", tag) if tag else {
+        "ok": None, "status": None, "detail": "no package target tag in artifacts.manifest",
+    }
+    partial = (
+        catalog_ok is True
+        and manifest.get("ok") is False
+        and manifest.get("status") == 404
+    )
+    bits = [f"registry pods {reg_ready}/{reg_total}"]
+    if catalog_detail:
+        bits.append(catalog_detail)
+    if tag:
+        bits.append(manifest.get("detail") or f"manifest {tag}=?")
+    if partial:
+        bits.append("PARTIAL_PUSH (repo in catalog, target manifest 404)")
+
+    # healthy: pods up, not known-absent catalog, not partial push, manifest not 404
+    healthy = (
+        reg_ready >= 1
+        and catalog_ok is not False
+        and not partial
+        and manifest.get("ok") is not False
+    )
+    return {
+        "registry_ready": reg_ready,
+        "registry_total": reg_total,
+        "catalog_has_app": catalog_ok,
+        "manifest_ok": manifest.get("ok"),
+        "manifest_status": manifest.get("status"),
+        "target_tag": tag,
+        "partial_push": partial,
+        "detail": "; ".join(bits),
+        "healthy": healthy,
+    }
+
+
+def _cluster_orient_summary(ctx: Ctx, *pod_censuses: dict) -> str:
+    """One-line orientation for detect/rem logs (single-node air-gap)."""
+    node = _node_schedulability_census(ctx)
+    reg = _registry_census(ctx)
+    parts = [node["summary"], reg["detail"]]
+    for pc in pod_censuses:
+        if pc:
+            parts.append(pc.get("summary") or "")
+    return " | ".join(p for p in parts if p)
 
 
 def _det_layer_a_images(ctx: Ctx) -> Probe:
@@ -781,15 +1336,36 @@ def _det_registry_pv(ctx: Ctx) -> Probe:
     don't exist. OK if the registry PVC is already Bound (e.g. a resourced cluster's
     pre-existing default SC handled it) OR the prebound PV is present so a fresh
     ``zarf init``'s PVC binds on creation."""
+    # Reclaim policy FIRST — a Bound-but-Delete static PV converges "healthy"
+    # while primed to erase the registry data on the next PVC churn (matrix
+    # case 15). Retain is the conservation contract; reclaim is mutable on a
+    # Bound PV, so this is always normalizable in place.
+    pv = ctx.get("pv", REGISTRY_PV_NAME)
+    if pv is not None:
+        pol = (pv.get("spec") or {}).get("persistentVolumeReclaimPolicy")
+        if pol != "Retain":
+            return Probe(False,
+                         f"registry PV reclaim={pol!r} (want Retain — conservation)")
     if any(p.get("status", {}).get("phase") == "Bound"
            for p in ctx.items("pvc", ns="zarf")):
         return Probe(True, "zarf registry PVC already Bound")
-    if ctx.exists("pv", "zarf-registry-pv"):
+    if pv is not None:
         return Probe(True, "claimRef registry PV present (PVC will bind on init)")
     return Probe(False, "no Bound registry PVC and no prebound registry PV")
 
 
 def _rem_registry_pv(ctx: Ctx) -> Fix:
+    # Reclaim drift on an EXISTING PV: merge-patch just the policy — never
+    # re-apply the full object over a Bound PV (claimRef/uid conflicts).
+    pv = ctx.get("pv", REGISTRY_PV_NAME)
+    if pv is not None and \
+            (pv.get("spec") or {}).get("persistentVolumeReclaimPolicy") != "Retain":
+        r = ctx.k(["patch", "pv", REGISTRY_PV_NAME, "--type", "merge",
+                   "-p", '{"spec":{"persistentVolumeReclaimPolicy":"Retain"}}'])
+        return Fix(r.returncode == 0,
+                   "normalized registry PV reclaim → Retain (conservation)"
+                   if r.returncode == 0 else
+                   f"failed to patch registry PV reclaim: rc={r.returncode}")
     # Apply the claimRef-prebound hostPath PV so the registry PVC binds with NO default
     # StorageClass. Idempotent; Layer-B (a disposable PV, not a transported artifact).
     # This is the single move that lets the resilient path skip the provisioner entirely.
@@ -955,6 +1531,17 @@ def _pre_init_cleanup(ctx: Ctx) -> List[str]:
         bad = bool(del_ts) or phase in ("Terminating", "Pending", "Lost") \
             or phase != "Bound" or cur != ""
         if bad:
+            # CONSERVATION backstop for LEGACY layouts (pre-v1.6.1 init): a Bound
+            # PVC on a dynamically provisioned PV (reclaimPolicy Delete) would
+            # take the registry DATA with it on delete. Patch the bound PV to
+            # Retain first — a mistaken delete then leaves the blobs on disk.
+            vol = (pvc.get("spec", {}) or {}).get("volumeName")
+            if vol and vol != REGISTRY_PV_NAME:
+                r = ctx.k(["patch", "pv", vol, "-p",
+                           '{"spec":{"persistentVolumeReclaimPolicy":"Retain"}}'])
+                if r.returncode == 0:
+                    actions.append(f"reclaim=Retain backstop on bound PV {vol} "
+                                   "(legacy-layout conservation)")
             if _force_delete_pvc(ctx, ZARF_NS, REGISTRY_PVC_NAME):
                 actions.append(
                     f"deleted registry PVC (was phase={phase} sc={cur!r} "
@@ -1092,7 +1679,9 @@ def _rem_registry_running(ctx: Ctx) -> Fix:
             except FileNotFoundError as e:
                 return _sp.CompletedProcess(argv, 127, "", str(e))
             except _sp.TimeoutExpired as e:
-                return _sp.CompletedProcess(argv, 124, e.stdout or "", "timeout")
+                return _sp.CompletedProcess(
+                    argv, 124, Ctx.out_text(e.stdout),
+                    Ctx.out_text(e.stderr) or "timeout")
         return ctx.zarf(args)
 
     r = _run_init()
@@ -1103,7 +1692,7 @@ def _rem_registry_running(ctx: Ctx) -> Fix:
         return Fix(True, f"zarf init: rc=0{tail}")
 
     # Second pass: seed-registry deadline / partial install often leaves recoverable state
-    if r.returncode in (1, 124) or "deadline" in (r.stderr or "").lower():
+    if r.returncode in (1, 124) or "deadline" in Ctx.out_text(r.stderr).lower():
         more = _unwedge_failed_seed_registry(ctx)
         more += _pre_init_cleanup(ctx)
         if more:
@@ -1128,25 +1717,26 @@ def _rem_registry_running(ctx: Ctx) -> Fix:
 # --------------------------------------------------------------------------- #
 
 def _det_images_pushed(ctx: Ctx) -> Probe:
-    # Proxy: if the operator / app pods are NOT in ImagePullBackOff and exist, the
-    # images are in the registry. Definitive when those components are deployed.
+    """App image pullable from in-cluster registry (catalog + v2 manifest HEAD)."""
     for ns, sel in (("dask-operator", "app.kubernetes.io/name=dask-kubernetes-operator"),
                     ("dask", "dask.org/component=scheduler")):
         miss = ctx.pod_image_missing(ns, sel)
         if miss is True:
             return Probe(False, f"{ns} pods in ImagePullBackOff — images not in registry")
-    if ctx.have_zarf():
-        r = ctx.zarf(["tools", "registry", "catalog"], timeout=60)
-        if r.returncode == 0:
-            if "cybersec-dask" in r.stdout:
-                return Probe(True, "registry catalog contains cybersec-dask")
-            # Evidence of ABSENCE: catalog reachable and the app repo isn't there.
-            # (Previously conservative-True — harmless only because required
-            # components re-push on every deploy; being precise keeps the report
-            # honest and pushes at T2 where it belongs.)
-            return Probe(False, "registry catalog reachable but cybersec-dask absent — push needed")
-    # Catalog unreachable / no pods to judge: defer to the component invariants.
-    return Probe(True, "no image-pull failures observed")
+    reg = _registry_census(ctx)
+    if reg.get("partial_push"):
+        return Probe(
+            False,
+            f"PARTIAL_PUSH — {reg['detail']}",
+        )
+    if reg.get("manifest_ok") is True:
+        return Probe(True, reg["detail"])
+    if reg.get("catalog_has_app") is False:
+        return Probe(False, f"registry catalog missing cybersec-dask — {reg['detail']}")
+    if reg.get("manifest_ok") is False:
+        return Probe(False, reg["detail"])
+    # Catalog/HEAD unknown: defer unless pods prove pull failure (above)
+    return Probe(True, reg["detail"] or "no image-pull failures observed")
 
 
 def _rem_images_pushed(ctx: Ctx) -> Fix:
@@ -1168,49 +1758,662 @@ def _rem_operator(ctx: Ctx) -> Fix:
 
 
 def _det_scheduler(ctx: Ctx) -> Probe:
-    ready, total = ctx.pods_ready("dask", "dask.org/component=scheduler")
-    return Probe(ready >= 1, f"scheduler ready {ready}/{total}")
+    """Scheduler Ready on *target* image — census node/registry/pod when not.
+
+    Ready-on-stale-image is a FAIL (dask operator does not roll children when the
+    CR image is rewritten by helm — converge-09 class upgrade silence).
+    """
+    pods = _pod_terminal_census(ctx, "dask", "dask.org/component=scheduler")
+    drift = _image_drift(ctx, "dask", "dask.org/component=scheduler")
+    if pods["ready"] >= 1:
+        if drift:
+            return Probe(
+                False,
+                f"scheduler Ready but {drift} — CR/helm advanced without rolling "
+                f"children; recycle scheduler pods or redeploy dask-cluster",
+            )
+        return Probe(True, f"scheduler ready {pods['ready']}/{pods['total']}")
+    orient = _cluster_orient_summary(ctx, pods)
+    if drift:
+        orient = f"{orient} | {drift}"
+    has_cr = bool(ctx.items("daskcluster", ns="dask")) or bool(
+        ctx.items("daskclusters", ns="dask"))
+    if pods["image_pull"]:
+        return Probe(
+            False,
+            f"scheduler ImagePull — registry/image rewrite. census: {orient} "
+            f"pull={pods['image_pull'][:3]} cr={'yes' if has_cr else 'no'}",
+        )
+    if pods["crash"]:
+        log_bits = _crash_log_census(ctx, "dask", "dask.org/component=scheduler")
+        log_s = ("\n" + "\n".join(log_bits)) if log_bits else ""
+        return Probe(
+            False,
+            f"scheduler CrashLoop/OOM. census: {orient} crash={pods['crash'][:3]}"
+            f"{log_s}",
+        )
+    node = _node_schedulability_census(ctx)
+    if pods["pending"] and not node["schedulable"]:
+        return Probe(
+            False,
+            f"scheduler Pending — node not schedulable (DiskPressure/taint/cordon). "
+            f"do NOT redeploy. census: {orient}",
+        )
+    if pods["pending"] and node["schedulable"]:
+        return Probe(
+            False,
+            f"scheduler Pending but node schedulable — recycle pod. census: {orient}",
+        )
+    if pods["total"] == 0:
+        return Probe(
+            False,
+            f"scheduler absent (0 pods) cr={'yes' if has_cr else 'no'}. census: {orient}",
+        )
+    return Probe(False, f"scheduler not Ready. census: {orient}")
 
 
 def _rem_scheduler(ctx: Ctx) -> Fix:
-    return _zarf_deploy_components(ctx, "dask-cluster")
+    """Census-driven scheduler rem (single-node air-gap).
+
+    Order:
+      1. Node not schedulable → MANUAL (DiskPressure) — no zarf
+      2. ImagePull → push cybersec-images (registry)
+      3. CrashLoop → recycle scheduler pod once; if still bad, redeploy dask-cluster
+      4. Pending + schedulable → recycle scheduler pod (operator recreates)
+      5. No pods / no CR → zarf package deploy dask-cluster
+      6. CR present, operator OK, still no Ready → redeploy dask-cluster
+    """
+    actions: List[str] = []
+    pods = _pod_terminal_census(ctx, "dask", "dask.org/component=scheduler")
+    node = _node_schedulability_census(ctx)
+    reg = _registry_census(ctx)
+    orient = _cluster_orient_summary(ctx, pods)
+
+    # 1) Node pressure / taint — FSM resolve when df >= hard; MANUAL only if df short
+    if not node["schedulable"] and (pods["pending"] or pods["total"] == 0 or pods["ready"] < 1):
+        if node.get("disk_pressure") or _disk_pressure_issues(ctx):
+            cleared = _platform.rem_resolve_disk_pressure(ctx)
+            actions.append(cleared.detail)
+            if cleared.changed:
+                node = _node_schedulability_census(ctx)
+            elif not node["schedulable"] and _disk_pressure_issues(ctx):
+                return Fix(False, cleared.detail)
+        if not _node_schedulability_census(ctx)["schedulable"]:
+            return Fix(bool(actions), _manual.join_detail(
+                f"scheduler blocked by node pressure/taint — {orient}. "
+                f"actions={actions}",
+                _manual.hint_for("T0.no-disk-pressure"),
+            ))
+
+    # 2) Image pull / catalog → ensure images in registry
+    if pods["image_pull"] or reg.get("catalog_has_app") is False:
+        fix = _zarf_deploy_components(ctx, "cybersec-images")
+        actions.append(fix.detail)
+        # recycle so kubelet re-pulls after push
+        ctx.k(["delete", "pod", "-n", "dask", "-l", "dask.org/component=scheduler",
+               "--force", "--grace-period=0", "--wait=false", "--ignore-not-found"])
+        actions.append("recycled scheduler pods after image push")
+        again = _pod_terminal_census(ctx, "dask", "dask.org/component=scheduler")
+        if again["ready"] >= 1 and not _image_drift(
+                ctx, "dask", "dask.org/component=scheduler"):
+            return Fix(True, f"images+recycle → scheduler Ready — "
+                             f"{_cluster_orient_summary(ctx, again)}")
+        # continue toward cluster redeploy if still missing
+
+    # 2b) Image drift — NEVER recycle-only (operator recreates from CR with the
+    # OLD tag → Ready-but-wrong forever; converge-10 class loop).
+    # Order: push target layers → retarget CR+Deployments → recycle pods →
+    # optional dask-cluster deploy → refuse success while drift remains.
+    drift = _image_drift(ctx, "dask", "dask.org/component=scheduler")
+    if drift and node["schedulable"]:
+        target = _target_cybersec_tag(ctx)
+        actions.append(f"image drift: {drift}")
+        # Layers must exist in the in-cluster registry before retarget
+        img_fix = _zarf_deploy_components(ctx, "cybersec-images")
+        actions.append(img_fix.detail)
+        actions.extend(_retarget_dask_workload_images(ctx, target))
+        ctx.k(["delete", "pod", "-n", "dask", "-l", "dask.org/component=scheduler",
+               "--force", "--grace-period=0", "--wait=false", "--ignore-not-found"])
+        ctx.k(["delete", "pod", "-n", "dask", "-l", "dask.org/component=worker",
+               "--force", "--grace-period=0", "--wait=false", "--ignore-not-found"])
+        actions.append("recycled dask pods after image retarget")
+        # If still drifted, full dask-cluster package path (templates new image)
+        if _image_drift(ctx, "dask", "dask.org/component=scheduler"):
+            fix = _zarf_deploy_components(ctx, "cybersec-images,dask-cluster")
+            actions.append(fix.detail)
+            actions.extend(_retarget_dask_workload_images(ctx, target))
+            ctx.k(["delete", "pod", "-n", "dask",
+                   "-l", "dask.org/component=scheduler",
+                   "--force", "--grace-period=0", "--wait=false",
+                   "--ignore-not-found"])
+            ctx.k(["delete", "pod", "-n", "dask",
+                   "-l", "dask.org/component=worker",
+                   "--force", "--grace-period=0", "--wait=false",
+                   "--ignore-not-found"])
+            actions.append("post-deploy recycle for image pickup")
+        again = _pod_terminal_census(ctx, "dask", "dask.org/component=scheduler")
+        still = _image_drift(ctx, "dask", "dask.org/component=scheduler")
+        if again["ready"] >= 1 and not still:
+            return Fix(True, f"image-drift rem → scheduler Ready on {target} — "
+                             f"{_cluster_orient_summary(ctx, again)}  "
+                             f"[{'; '.join(actions)}]")
+        # Dual-package / package≠engine-manifest skew: MANUAL not infinite loop
+        hint = (
+            "Image drift remains after push+retarget+recycle. Common cause: "
+            "engine artifacts.manifest target tag is not in the staged "
+            "zarf-package (two 1.6.6 tarballs with different content tags). "
+            "Keep ONE package that matches the engine, re-transport if needed, "
+            "then: zarf package deploy $PKG --confirm "
+            "--components=cybersec-images,dask-cluster"
+        )
+        return Fix(bool(actions), _manual.join_detail(
+            f"image drift NOT cleared — still: {still or drift}; "
+            f"running={_running_cybersec_ref(ctx, 'dask', 'dask.org/component=scheduler')}; "
+            f"actions=[{'; '.join(actions)}]",
+            hint,
+        ))
+
+    # 3/4) Recycle on CrashLoop or Pending-while-schedulable
+    if pods["crash"] or (pods["pending"] and node["schedulable"]) or (
+            pods["total"] > 0 and pods["ready"] < 1 and node["schedulable"]
+            and not pods["image_pull"]):
+        r = ctx.k([
+            "delete", "pod", "-n", "dask", "-l", "dask.org/component=scheduler",
+            "--force", "--grace-period=0", "--wait=false", "--ignore-not-found",
+        ])
+        if r.returncode == 0:
+            actions.append("recycled scheduler pod(s) for reschedule/restart")
+        # Give operator a moment is next pass; also try worker cap if OOM/insufficient
+        hints = " ".join(
+            m for p in pods["pending"] for m in (p.get("msgs") or [])
+        ).lower()
+        if any(x in hints for x in ("insufficient", "memory", "cpu")) or pods["crash"]:
+            cap = _rem_workers_capacity(ctx)
+            if cap.changed:
+                actions.append(cap.detail)
+        again = _pod_terminal_census(ctx, "dask", "dask.org/component=scheduler")
+        # Do not declare success while image drift remains (Ready ≠ correct tag)
+        if again["ready"] >= 1 and not _image_drift(
+                ctx, "dask", "dask.org/component=scheduler"):
+            return Fix(True, f"recycle → scheduler Ready — "
+                             f"{_cluster_orient_summary(ctx, again)}  "
+                             f"[unwound: {'; '.join(actions)}]")
+        if again["pending"] and not _node_schedulability_census(ctx)["schedulable"]:
+            return Fix(bool(actions), _manual.join_detail(
+                f"recycled; still blocked by node — {_cluster_orient_summary(ctx, again)}",
+                _manual.hint_for("T0.no-disk-pressure"),
+            ))
+        # fall through to deploy if CR/pods still broken
+
+    # 5/6) Package path — create/reconcile DaskCluster
+    fix = _zarf_deploy_components(ctx, "dask-cluster")
+    detail = fix.detail
+    if actions:
+        detail = f"{detail}  [prior: {'; '.join(actions)}]"
+    # After deploy, if wait action timed out but CR exists, recycle once more
+    final = _pod_terminal_census(ctx, "dask", "dask.org/component=scheduler")
+    if final["ready"] < 1 and final["total"] >= 1 and node["schedulable"]:
+        ctx.k(["delete", "pod", "-n", "dask", "-l", "dask.org/component=scheduler",
+               "--force", "--grace-period=0", "--wait=false", "--ignore-not-found"])
+        detail += "  [post-deploy recycle scheduler for readiness]"
+        # Progress, not success — next pass re-detects Ready/drift
+        return Fix(True, detail)
+    if final["ready"] >= 1 and not _image_drift(
+            ctx, "dask", "dask.org/component=scheduler"):
+        return Fix(True, f"dask-cluster rem → scheduler Ready — "
+                         f"{_cluster_orient_summary(ctx, final)}")
+    if final["ready"] >= 1 and _image_drift(
+            ctx, "dask", "dask.org/component=scheduler"):
+        # Deploy "succeeded" but wrong content tag still running — do not loop
+        # as success; force image-drift path next pass via failed detect
+        return Fix(True, detail + "  [deployed but image drift remains — "
+                   "next pass will retarget CR/Deployments]")
+    return Fix(fix.changed or bool(actions), detail)
 
 
-def _det_workers_capacity(ctx: Ctx) -> Probe:
-    """No perpetually-Pending workers: requested replicas must fit schedulable
-    capacity. This is the oversubscription failure that strands otel-navigator."""
-    pods = ctx.items("pods", ns="dask", selector="dask.org/component=worker")
-    pending = [p["metadata"]["name"] for p in pods
-               if p.get("status", {}).get("phase") == "Pending"]
-    return Probe(not pending, f"{len(pending)} worker(s) Pending (oversubscribed)"
-                 if pending else f"{len(pods)} worker(s), none Pending")
+# --------------------------------------------------------------------------- #
+# T4.workers-capacity — surgical worker REPLICAS + SIZING (engine ≥ 0.5.0)
+# --------------------------------------------------------------------------- #
+# Package wire (zarf.yaml / dask-cluster.yaml):
+#   DASK_WORKER_REPLICAS  → spec.worker.replicas
+#   DASK_WORKER_NTHREADS  → container args --nthreads
+#   DASK_WORKER_CPU       → resources.limits.cpu  (≥ nthreads)
+#   DASK_WORKER_MEMORY    → resources.limits.memory + args --memory-limit
+# Aliases (v1.6.5 docs; not package vars — engine folds them):
+#   DASK_WORKER_MEM_LIMIT   → DASK_WORKER_MEMORY
+#   DASK_WORKER_MEM_REQUEST → resources.requests.memory (optional)
+#
+# The dask-kubernetes operator often only propagates *replicas* on a live CR;
+# template/sizing changes need a worker pod (or Deployment) bounce. We never
+# re-push images for scale/size — patch CR + recycle workers only.
 
 
-def _rem_workers_capacity(ctx: Ctx) -> Fix:
-    """Make the actual worker pods fit schedulable capacity so the viz pod gets a
-    node. Two parts — because the operator may leave ORPHANED worker Deployments it
-    never reaps (the "spec says 4 but 16 pods, 5 Pending" state we hit):
-      1. set DaskCluster spec.worker.replicas = target (the source of truth);
-      2. reap the EXCESS worker Deployments down to target, least-ready (Pending)
-         first — don't trust the spec, count the real Deployments.
-    target leaves one node's headroom for panel-viz/engine/jupyter. Layer-B; never
-    touches images."""
+def _s3_lookup(ctx: Ctx, *keys: str) -> str:
+    """First non-empty ctx.s3 value among keys (exact then upper/lower)."""
+    for k in keys:
+        for cand in (k, k.upper(), k.lower()):
+            v = ctx.s3.get(cand)
+            if v is not None and str(v).strip():
+                return str(v).strip()
+    return ""
+
+
+def _normalize_worker_aliases(ctx: Ctx) -> None:
+    """Fold DASK_WORKER_MEM_LIMIT / MEM_REQUEST into canonical keys on ctx.s3.
+
+    Package honors DASK_WORKER_MEMORY only; operators following older docs may
+    still export MEM_LIMIT / MEM_REQUEST. Mutates ctx.s3 in place so subsequent
+    zarf deploys also get the canonical names.
+    """
+    mem = _s3_lookup(ctx, "DASK_WORKER_MEMORY")
+    if not mem:
+        alt = _s3_lookup(ctx, "DASK_WORKER_MEM_LIMIT")
+        if not alt:
+            alt = _s3_lookup(ctx, "DASK_WORKER_MEM_REQUEST")
+        if alt:
+            ctx.s3["DASK_WORKER_MEMORY"] = alt
+
+
+def _normalize_k8s_qty(v: Optional[str]) -> str:
+    """Loose equality for CPU/memory quantities ('2'=='2.0', '6Gi'=='6gi')."""
+    if v is None:
+        return ""
+    s = str(v).strip()
+    if not s:
+        return ""
+    # CPU millicores
+    if s.endswith("m") and s[:-1].replace(".", "", 1).isdigit():
+        try:
+            return f"{float(s[:-1]) / 1000:g}"
+        except ValueError:
+            return s.lower()
+    # Bare number (CPU cores)
+    try:
+        return f"{float(s):g}"
+    except ValueError:
+        pass
+    # Memory → GiB then back to a canonical "Xgi" string
+    gib = _mem_to_gib(s)
+    if gib > 0:
+        return f"{gib:g}gi"
+    return s.lower()
+
+
+def _arg_after(args: list, flag: str) -> Optional[str]:
+    """Value following ``flag`` in a container args list, or None."""
+    for i, a in enumerate(args):
+        if a == flag and i + 1 < len(args):
+            return str(args[i + 1])
+        # also accept --flag=value
+        if isinstance(a, str) and a.startswith(flag + "="):
+            return a.split("=", 1)[1]
+    return None
+
+
+def _set_arg(args: list, flag: str, value: str) -> list:
+    """Return a copy of args with ``flag value`` set (insert near dask-worker)."""
+    out = list(args or [])
+    for i, a in enumerate(out):
+        if a == flag and i + 1 < len(out):
+            out[i + 1] = str(value)
+            return out
+        if isinstance(a, str) and a.startswith(flag + "="):
+            out[i] = f"{flag}={value}"
+            return out
+    # Insert after binary name when present
+    insert_at = 1 if out and not str(out[0]).startswith("-") else len(out)
+    out[insert_at:insert_at] = [flag, str(value)]
+    return out
+
+
+def _desired_worker_sizing(ctx: Ctx) -> dict:
+    """Desired worker sizing from ctx.s3 (after alias fold).
+
+    ``replicas`` is int when DASK_WORKER_REPLICAS is set, else None (do not
+    force scale-up — only cap oversubscription). Sizing fields are None when
+    unset so we do not thrash a manually sized CR back to package defaults.
+    """
+    _normalize_worker_aliases(ctx)
+    rep_s = _s3_lookup(ctx, "DASK_WORKER_REPLICAS")
+    replicas = None
+    if rep_s:
+        try:
+            replicas = max(1, int(float(rep_s)))
+        except ValueError:
+            replicas = _WORKER_DEFAULT_REPLICAS
+    return {
+        "replicas": replicas,
+        "replicas_explicit": bool(rep_s),
+        "nthreads": _s3_lookup(ctx, "DASK_WORKER_NTHREADS") or None,
+        "cpu": _s3_lookup(ctx, "DASK_WORKER_CPU") or None,
+        "memory": _s3_lookup(ctx, "DASK_WORKER_MEMORY") or None,
+        "mem_request": _s3_lookup(ctx, "DASK_WORKER_MEM_REQUEST") or None,
+    }
+
+
+def _live_worker_sizing(ctx: Ctx) -> Optional[dict]:
+    """Read live DaskCluster/cybersec-dask worker sizing. None if CR absent."""
+    cr = ctx.get("daskcluster", "cybersec-dask", ns="dask")
+    if not cr:
+        return None
+    w = (cr.get("spec") or {}).get("worker") or {}
+    replicas = w.get("replicas")
+    try:
+        replicas_i = int(replicas) if replicas is not None else None
+    except (TypeError, ValueError):
+        replicas_i = None
+    containers = ((w.get("spec") or {}).get("containers") or [])
+    c = next((x for x in containers if x.get("name") == "worker"),
+             containers[0] if containers else {})
+    args = list(c.get("args") or [])
+    nthreads = _arg_after(args, "--nthreads")
+    mem_arg = _arg_after(args, "--memory-limit")
+    limits = ((c.get("resources") or {}).get("limits") or {})
+    requests = ((c.get("resources") or {}).get("requests") or {})
+    mem_limit = limits.get("memory") or mem_arg
+    return {
+        "replicas": replicas_i,
+        "nthreads": str(nthreads) if nthreads is not None else None,
+        "cpu": str(limits["cpu"]) if limits.get("cpu") is not None else None,
+        "memory": str(mem_limit) if mem_limit is not None else None,
+        "mem_request": str(requests["memory"]) if requests.get("memory") is not None else None,
+        "mem_arg": str(mem_arg) if mem_arg is not None else None,
+        "_cr": cr,
+        "_worker": w,
+        "_container": c,
+        "_args": args,
+    }
+
+
+def _mem_fit_workers(ctx: Ctx, per_worker_memory: str) -> int:
+    """Max workers that fit total allocatable RAM after headroom."""
     cap = ctx.node_capacity()
-    target = max(1, cap["schedulable_nodes"] - 1)
-    ctx.k(["patch", "daskcluster", "cybersec-dask", "-n", "dask", "--type", "merge",
-           "-p", json.dumps({"spec": {"worker": {"replicas": target}}})])
+    total = float(cap.get("total_mem_gib") or 0.0)
+    wgib = _mem_to_gib(per_worker_memory) or _mem_to_gib(_WORKER_DEFAULT_MEMORY) or 6.0
+    if wgib <= 0:
+        wgib = 6.0
+    usable = total - _WORKER_MEM_HEADROOM_GIB
+    if usable < wgib:
+        return 1
+    return max(1, int(usable // wgib))
+
+
+def _target_worker_replicas(ctx: Ctx, desired: dict, live: Optional[dict],
+                            pending_count: int = 0,
+                            non_pending_count: int = 0) -> int:
+    """Capacity-capped replica target.
+
+    * Explicit ``DASK_WORKER_REPLICAS`` → min(desired, mem_fit), then pending shrink.
+    * Unset → keep live count (min 1), only shrink for mem_fit / Pending.
+    Replaces the old ``schedulable_nodes − 1`` heuristic that pinned fat single
+    nodes to one worker.
+    """
+    per_mem = (desired.get("memory")
+               or (live or {}).get("memory")
+               or _WORKER_DEFAULT_MEMORY)
+    mem_fit = _mem_fit_workers(ctx, per_mem)
+    if desired.get("replicas") is not None:
+        want = int(desired["replicas"])
+    else:
+        want = int((live or {}).get("replicas") or _WORKER_DEFAULT_REPLICAS)
+        # Without an explicit desired, never scale *up* — only preserve/cap.
+        if live and live.get("replicas") is not None:
+            want = min(want, int(live["replicas"]))
+    target = max(1, min(want, mem_fit))
+    # Pending oversubscription: do not keep asking for pods that cannot schedule.
+    if pending_count > 0 and non_pending_count >= 1:
+        target = min(target, non_pending_count)
+    elif pending_count > 0 and non_pending_count == 0:
+        target = 1
+    return max(1, target)
+
+
+def _worker_sizing_drifts(live: dict, desired: dict, target_replicas: int) -> list:
+    """Human-readable field drifts (replicas + explicit sizing fields only)."""
+    drifts = []
+    live_rep = live.get("replicas")
+    if live_rep is None or int(live_rep) != int(target_replicas):
+        drifts.append(f"replicas {live_rep}→{target_replicas}")
+    for key, label in (("nthreads", "nthreads"), ("cpu", "cpu"),
+                       ("memory", "memory"), ("mem_request", "mem_request")):
+        want = desired.get(key)
+        if not want:
+            continue  # unset → do not force package default onto live CR
+        have = live.get(key)
+        if key == "memory" and not have:
+            have = live.get("mem_arg")
+        if _normalize_k8s_qty(have) != _normalize_k8s_qty(want):
+            drifts.append(f"{label} {have or '∅'}→{want}")
+    # --memory-limit arg can drift from limits.memory even when desired matches limits
+    if desired.get("memory") and live.get("mem_arg"):
+        if _normalize_k8s_qty(live["mem_arg"]) != _normalize_k8s_qty(desired["memory"]):
+            msg = f"memory-arg {live['mem_arg']}→{desired['memory']}"
+            if msg not in drifts and not any(d.startswith("memory ") for d in drifts):
+                drifts.append(msg)
+    return drifts
+
+
+def _stamp_worker_sizing(ctx: Ctx, desired: dict, target_replicas: int) -> None:
+    """Write effective sizing into ctx.s3 so later zarf deploys preserve it."""
+    ctx.s3["DASK_WORKER_REPLICAS"] = str(target_replicas)
+    if desired.get("nthreads"):
+        ctx.s3["DASK_WORKER_NTHREADS"] = str(desired["nthreads"])
+    if desired.get("cpu"):
+        ctx.s3["DASK_WORKER_CPU"] = str(desired["cpu"])
+    if desired.get("memory"):
+        ctx.s3["DASK_WORKER_MEMORY"] = str(desired["memory"])
+    if desired.get("mem_request"):
+        ctx.s3["DASK_WORKER_MEM_REQUEST"] = str(desired["mem_request"])
+
+
+def _patch_daskcluster_worker_sizing(ctx: Ctx, live: dict, desired: dict,
+                                     target_replicas: int) -> tuple:
+    """Merge-patch DaskCluster worker replicas + template sizing.
+
+    Returns (changed: bool, detail: str, template_changed: bool).
+    ``template_changed`` means nthreads/cpu/memory changed → must bounce workers.
+    """
+    w = dict(live.get("_worker") or {})
+    w["replicas"] = int(target_replicas)
+    # Deep-ish copy of pod template so we do not mutate the cached live dict oddly
+    spec = dict(w.get("spec") or {})
+    containers = [dict(c) for c in (spec.get("containers") or [])]
+    if not containers:
+        containers = [{"name": "worker", "args": ["dask-worker"]}]
+    # Prefer the container named worker
+    idx = next((i for i, c in enumerate(containers) if c.get("name") == "worker"), 0)
+    c = dict(containers[idx])
+    args = list(c.get("args") or live.get("_args") or ["dask-worker"])
+    template_changed = False
+
+    if desired.get("nthreads"):
+        before = _arg_after(args, "--nthreads")
+        args = _set_arg(args, "--nthreads", str(desired["nthreads"]))
+        if _normalize_k8s_qty(before) != _normalize_k8s_qty(desired["nthreads"]):
+            template_changed = True
+    if desired.get("memory"):
+        before = _arg_after(args, "--memory-limit")
+        args = _set_arg(args, "--memory-limit", str(desired["memory"]))
+        if _normalize_k8s_qty(before) != _normalize_k8s_qty(desired["memory"]):
+            template_changed = True
+    c["args"] = args
+
+    resources = dict(c.get("resources") or {})
+    limits = dict(resources.get("limits") or {})
+    requests = dict(resources.get("requests") or {})
+    if desired.get("cpu"):
+        if _normalize_k8s_qty(limits.get("cpu")) != _normalize_k8s_qty(desired["cpu"]):
+            template_changed = True
+        limits["cpu"] = str(desired["cpu"])
+    if desired.get("memory"):
+        if _normalize_k8s_qty(limits.get("memory")) != _normalize_k8s_qty(desired["memory"]):
+            template_changed = True
+        limits["memory"] = str(desired["memory"])
+    if desired.get("mem_request"):
+        if _normalize_k8s_qty(requests.get("memory")) != _normalize_k8s_qty(desired["mem_request"]):
+            template_changed = True
+        requests["memory"] = str(desired["mem_request"])
+    if limits:
+        resources["limits"] = limits
+    if requests:
+        resources["requests"] = requests
+    if resources:
+        c["resources"] = resources
+    containers[idx] = c
+    spec["containers"] = containers
+    w["spec"] = spec
+
+    rep_changed = live.get("replicas") != int(target_replicas)
+    if not rep_changed and not template_changed:
+        return False, f"DaskCluster worker already at target {target_replicas}", False
+
+    r = ctx.k(["patch", "daskcluster", "cybersec-dask", "-n", "dask", "--type", "merge",
+               "-p", json.dumps({"spec": {"worker": w}})])
+    if r.returncode != 0:
+        err = (r.stderr or r.stdout or "").strip()[:300]
+        return False, f"daskcluster patch failed: {err}", False
+    parts = []
+    if rep_changed:
+        parts.append(f"replicas→{target_replicas}")
+    if template_changed:
+        fields = [k for k in ("nthreads", "cpu", "memory", "mem_request") if desired.get(k)]
+        parts.append("sizing " + ",".join(fields))
+    return True, "patched DaskCluster worker: " + ", ".join(parts), template_changed
+
+
+def _reap_excess_worker_deployments(ctx: Ctx, target: int) -> tuple:
+    """Delete excess worker Deployments (Pending/least-ready first). (reaped, detail)."""
     deps = ctx.items("deployments", ns="dask", selector="dask.org/component=worker")
     excess = len(deps) - target
     if excess <= 0:
-        return Fix(False, f"{len(deps)} worker deployment(s) ≤ target {target}; nothing to reap")
-    deps.sort(key=lambda d: d.get("status", {}).get("readyReplicas", 0))  # Pending first
+        return 0, f"{len(deps)} worker deployment(s) ≤ target {target}"
+    deps.sort(key=lambda d: d.get("status", {}).get("readyReplicas") or 0)
     reaped = 0
     for d in deps[:excess]:
         if ctx.k(["delete", "deployment", d["metadata"]["name"], "-n", "dask",
                   "--wait=false"]).returncode == 0:
             reaped += 1
-    return Fix(reaped > 0, f"capped to {target} (schedulable={cap['schedulable_nodes']}); "
-                           f"reaped {reaped} orphaned/excess worker deployment(s)")
+    return reaped, f"reaped {reaped}/{excess} excess worker deployment(s)"
+
+
+def _recycle_worker_pods(ctx: Ctx) -> str:
+    """Force worker pods to recreate so they pick up template sizing/image."""
+    r = ctx.k(["delete", "pod", "-n", "dask", "-l", "dask.org/component=worker",
+               "--force", "--grace-period=0", "--wait=false", "--ignore-not-found"])
+    if r.returncode == 0:
+        return "recycled worker pods (template pickup)"
+    return f"worker pod recycle rc={r.returncode}"
+
+
+def _det_workers_capacity(ctx: Ctx) -> Probe:
+    """Workers match desired sizing (when set), fit RAM capacity, none Pending.
+
+    Detects:
+      * Pending workers (oversubscription stranding panel memory)
+      * CR / Deployment count drift vs capacity-capped target
+      * Explicit DASK_WORKER_* sizing drift (nthreads / cpu / memory)
+    """
+    live = _live_worker_sizing(ctx)
+    if live is None:
+        # CR absent is T4.scheduler's job — not a capacity failure. Returning
+        # FAIL here thrashes rem every pass while scheduler Deployment may
+        # already be healthy (converge-11/12: "missing" spam + false progress).
+        return Probe(True, "DaskCluster CR absent — capacity N/A until T4.scheduler "
+                           "creates it (not a worker oversubscription failure)")
+    desired = _desired_worker_sizing(ctx)
+    pods = ctx.items("pods", ns="dask", selector="dask.org/component=worker")
+    pending = [p for p in pods
+               if (p.get("status") or {}).get("phase") == "Pending"]
+    non_pending = len(pods) - len(pending)
+    target = _target_worker_replicas(ctx, desired, live, len(pending), non_pending)
+    drifts = _worker_sizing_drifts(live, desired, target)
+    deps = ctx.items("deployments", ns="dask", selector="dask.org/component=worker")
+    issues = []
+    if pending:
+        issues.append(f"{len(pending)} worker(s) Pending (oversubscribed)")
+    if drifts:
+        issues.append("sizing drift: " + ", ".join(drifts))
+    if len(deps) > target:
+        issues.append(f"{len(deps)} worker Deployments > target {target}")
+    # Under-count when operator asked for more and capacity allows (no Pending)
+    if (desired.get("replicas") is not None
+            and not pending
+            and (live.get("replicas") or 0) < target):
+        issues.append(f"under-provisioned: CR replicas {live.get('replicas')} < target {target}")
+    if issues:
+        return Probe(False, "; ".join(issues)
+                     + f"  [target={target} live={live.get('replicas')} "
+                     f"pods={len(pods)} pending={len(pending)} "
+                     f"mem_fit={_mem_fit_workers(ctx, desired.get('memory') or live.get('memory') or _WORKER_DEFAULT_MEMORY)}]")
+    size_bits = []
+    if live.get("nthreads"):
+        size_bits.append(f"nthreads={live['nthreads']}")
+    if live.get("cpu"):
+        size_bits.append(f"cpu={live['cpu']}")
+    if live.get("memory"):
+        size_bits.append(f"mem={live['memory']}")
+    extra = (" " + " ".join(size_bits)) if size_bits else ""
+    return Probe(True, f"{len(pods)} worker(s), none Pending, "
+                       f"replicas={live.get('replicas')} target={target}{extra}")
+
+
+def _rem_workers_capacity(ctx: Ctx) -> Fix:
+    """Surgical worker scale + sizing — no zarf re-push, no CR recreate.
+
+    1. Fold MEM_LIMIT/MEM_REQUEST aliases → canonical DASK_WORKER_* on ctx.s3.
+    2. Compute capacity-capped target (RAM headroom, Pending shrink).
+    3. Merge-patch DaskCluster worker.replicas + template (nthreads/cpu/memory).
+    4. If template sizing changed: recycle worker pods (operator often skips roll).
+    5. Reap orphaned/excess worker Deployments (least-ready first).
+    6. Stamp effective sizing into ctx.s3 so later component deploys preserve it.
+    """
+    live = _live_worker_sizing(ctx)
+    if live is None:
+        return Fix(False, "no DaskCluster cybersec-dask — T4.scheduler must create it first")
+    desired = _desired_worker_sizing(ctx)
+    pods = ctx.items("pods", ns="dask", selector="dask.org/component=worker")
+    pending = [p for p in pods
+               if (p.get("status") or {}).get("phase") == "Pending"]
+    non_pending = len(pods) - len(pending)
+    target = _target_worker_replicas(ctx, desired, live, len(pending), non_pending)
+    drifts = _worker_sizing_drifts(live, desired, target)
+    deps = ctx.items("deployments", ns="dask", selector="dask.org/component=worker")
+    needs_work = bool(drifts) or len(deps) > target or bool(pending)
+    if not needs_work and (live.get("replicas") or 0) >= target:
+        _stamp_worker_sizing(ctx, desired, target)
+        return Fix(False, f"workers already at target {target} "
+                          f"(replicas={live.get('replicas')}, pods={len(pods)}, "
+                          f"deploys={len(deps)}); nothing to do")
+
+    actions = []
+    # Always stamp before patch so concurrent zarf paths see the cap
+    _stamp_worker_sizing(ctx, desired, target)
+
+    changed, detail, template_changed = _patch_daskcluster_worker_sizing(
+        ctx, live, desired, target)
+    if detail:
+        actions.append(detail)
+    if not changed and "failed" in detail:
+        return Fix(False, detail)
+
+    if template_changed or any(
+            d.startswith(("nthreads", "cpu", "memory", "mem_request", "memory-arg"))
+            for d in drifts):
+        actions.append(_recycle_worker_pods(ctx))
+
+    reaped, reap_detail = _reap_excess_worker_deployments(ctx, target)
+    if reaped > 0:
+        actions.append(reap_detail)
+    elif len(deps) > target:
+        actions.append(reap_detail)
+
+    cap = ctx.node_capacity()
+    summary = (f"target={target} (desired={desired.get('replicas') or 'live'}, "
+               f"mem_fit={_mem_fit_workers(ctx, desired.get('memory') or live.get('memory') or _WORKER_DEFAULT_MEMORY)}, "
+               f"nodes={cap.get('schedulable_nodes')} mem={cap.get('total_mem_gib')}Gi)")
+    if not actions:
+        return Fix(False, f"no worker changes applied; {summary}")
+    return Fix(True, f"{' | '.join(actions)}  [{summary}]")
 
 
 # --- image-drift detection (so `apply` rolls a content/tag change) ----------
@@ -1229,10 +2432,38 @@ def _image_tag(ref: str) -> str:
     return tag.split("-zarf-", 1)[0]
 
 
+def _retarget_image_ref(ref: str, target_tag: str) -> str:
+    """Rewrite a (possibly zarf-rewritten) cybersec-dask ref to ``target_tag``.
+
+    Preserves the registry host (``127.0.0.1:31999`` etc.) so pulls stay
+    in-cluster. Drops any ``-zarf-HASH`` suffix — that hash is content-bound to
+    the *old* push; the new tag is pullable as ``host/cybersec-dask:TARGET``
+    after ``cybersec-images`` re-push (zarf may rewrite again on next create).
+
+    '127.0.0.1:31999/cybersec-dask:2025.2.0-OLD-zarf-ABC' + '2025.2.0-NEW'
+      → '127.0.0.1:31999/cybersec-dask:2025.2.0-NEW'
+    """
+    if not ref or not target_tag or "cybersec-dask" not in ref:
+        return ref
+    base, _at, _digest = ref.partition("@")
+    if ":" not in base.rsplit("/", 1)[-1]:
+        return ref
+    prefix, _, _tag = base.rpartition(":")
+    return f"{prefix}:{target_tag}"
+
+
 def _target_cybersec_tag(ctx: Ctx) -> str:
     for img in ctx.manifest.get("package_images", {}).get("images", []):
         if "cybersec-dask" in img.get("ref", ""):
             return _image_tag(img["ref"])
+    return ""
+
+
+def _target_cybersec_ref(ctx: Ctx) -> str:
+    """Preferred full ref from artifacts.manifest (pre-zarf-rewrite)."""
+    for img in ctx.manifest.get("package_images", {}).get("images", []):
+        if "cybersec-dask" in img.get("ref", ""):
+            return img["ref"]
     return ""
 
 
@@ -1250,6 +2481,132 @@ def _image_drift(ctx: Ctx, ns: str, selector: str) -> "str | None":
                 if running and running != target:
                     return f"image drift: running {running}, target {target}"
     return None
+
+
+def _running_cybersec_ref(ctx: Ctx, ns: str, selector: str) -> str:
+    for p in ctx.items("pods", ns=ns, selector=selector):
+        for c in p.get("spec", {}).get("containers", []):
+            img = c.get("image", "")
+            if "cybersec-dask" in img:
+                return img
+    return ""
+
+
+def _retarget_deployments_cybersec(ctx: Ctx, ns: str,
+                                   selector: Optional[str] = None,
+                                   target_tag: str = "") -> List[str]:
+    """Patch Deployments in ``ns`` whose containers use cybersec-dask → target_tag.
+
+    Used for Dask children and panel-viz (otel-navigator, navigator-engine).
+    Caller must recycle pods after — Deployment template change alone is not
+    enough under IfNotPresent + stale RS.
+    """
+    actions: List[str] = []
+    target_tag = target_tag or _target_cybersec_tag(ctx)
+    if not target_tag:
+        return actions
+    deps = (ctx.items("deployments", ns=ns, selector=selector) if selector
+            else ctx.items("deployments", ns=ns))
+    for dep in deps:
+        name = (dep.get("metadata") or {}).get("name")
+        if not name:
+            continue
+        tpl = (((dep.get("spec") or {}).get("template") or {}).get("spec") or {})
+        containers = tpl.get("containers") or []
+        new_containers = []
+        dep_changed = False
+        pairs: List[str] = []
+        for c in containers:
+            c = dict(c)
+            img = c.get("image") or ""
+            if "cybersec-dask" in img:
+                new = _retarget_image_ref(img, target_tag)
+                if new != img:
+                    c["image"] = new
+                    dep_changed = True
+                    pairs.append(f"{c.get('name', 'app')}={new}")
+            new_containers.append(c)
+        if not dep_changed:
+            continue
+        r = ctx.k(["set", "image", f"deployment/{name}", "-n", ns, *pairs])
+        if r.returncode != 0:
+            patch = {"spec": {"template": {"spec": {"containers": new_containers}}}}
+            r = ctx.k(["patch", "deployment", name, "-n", ns,
+                       "--type", "strategic", "-p", json.dumps(patch)])
+        actions.append(
+            f"retargeted {ns}/Deployment/{name} → {target_tag}"
+            if r.returncode == 0 else
+            f"{ns}/Deployment/{name} retarget rc={r.returncode}")
+    return actions
+
+
+def _retarget_dask_workload_images(ctx: Ctx, target_tag: str) -> List[str]:
+    """Patch DaskCluster CR + Deployments so children recreate on target tag.
+
+    Operator is creation-only for many fields and will not roll image-only CR
+    updates — we patch both the CR (source of truth for next CREATE) and live
+    Deployments, then the caller must delete pods. Never touches Layer-A.
+    """
+    actions: List[str] = []
+    if not target_tag:
+        return actions
+
+    # --- DaskCluster CR ---
+    cr = ctx.get("daskcluster", "cybersec-dask", ns="dask")
+    if cr:
+        w = (cr.get("spec") or {}).get("worker") or {}
+        s = (cr.get("spec") or {}).get("scheduler") or {}
+        changed = False
+        for role, block in (("scheduler", s), ("worker", w)):
+            containers = ((block.get("spec") or {}).get("containers") or [])
+            for c in containers:
+                img = c.get("image") or ""
+                if "cybersec-dask" not in img:
+                    continue
+                new = _retarget_image_ref(img, target_tag)
+                if new != img:
+                    c["image"] = new
+                    changed = True
+        if changed:
+            patch = {"spec": {"scheduler": s, "worker": w}}
+            r = ctx.k(["patch", "daskcluster", "cybersec-dask", "-n", "dask",
+                       "--type", "merge", "-p", json.dumps(patch)])
+            actions.append(
+                f"patched DaskCluster images → {target_tag}"
+                if r.returncode == 0 else
+                f"DaskCluster image patch rc={r.returncode}")
+
+    # --- Live Deployments ---
+    for sel in ("dask.org/component=scheduler", "dask.org/component=worker"):
+        actions.extend(_retarget_deployments_cybersec(ctx, "dask", sel, target_tag))
+    return actions
+
+
+def _rem_panel_image_drift(ctx: Ctx, app: str, components: str) -> List[str]:
+    """Clear cybersec-dask image drift on a panel-viz app (converge-11/12 class).
+
+    Same pathology as scheduler: zarf/helm updates leave Deployment on old tag;
+    recycle-only recreates from the old template. Push → retarget Deployment →
+    recycle; package redeploy if still drifted.
+    """
+    actions: List[str] = []
+    sel = f"app={app}"
+    drift = _image_drift(ctx, _PANEL_NS, sel)
+    if not drift:
+        return actions
+    target = _target_cybersec_tag(ctx)
+    actions.append(f"{app} {drift}")
+    if ctx.have_zarf() and ctx.package_path:
+        fix = _zarf_deploy_components(ctx, "cybersec-images")
+        actions.append(fix.detail)
+    actions.extend(_retarget_deployments_cybersec(ctx, _PANEL_NS, sel, target))
+    actions.extend(_recycle_panel_pods(ctx, sel))
+    if _image_drift(ctx, _PANEL_NS, sel) and ctx.have_zarf() and ctx.package_path:
+        fix = _zarf_deploy_components(ctx, components)
+        actions.append(fix.detail)
+        actions.extend(_retarget_deployments_cybersec(ctx, _PANEL_NS, sel, target))
+        actions.extend(_recycle_panel_pods(ctx, sel))
+    return actions
 
 
 # --------------------------------------------------------------------------- #
@@ -1309,6 +2666,169 @@ def _panel_s3_config_issue(ctx: Ctx) -> Optional[str]:
     return None
 
 
+# --------------------------------------------------------------------------- #
+# In-situ crash log census (logs never leave the closed world)
+# --------------------------------------------------------------------------- #
+# Operators cannot exfiltrate pod logs; when CrashLoop/high restartCount is
+# visible, the engine pulls a short tail and classifies high-signal findings so
+# remediations and LIVE STATE name the next action without kubectl folklore.
+
+_LOG_TAIL_LINES = 100
+_RESTART_LOG_THRESHOLD = 3  # sample logs at ≥ this restartCount when not ready
+
+# (regex, finding_id, operator/engine hint) — first match wins per line; we keep
+# unique finding_ids. Never capture secrets (no patterns on KEY=value tokens).
+_LOG_FINDINGS: Tuple[Tuple[re.Pattern, str, str], ...] = (
+    (re.compile(r"ModuleNotFoundError|ImportError|No module named", re.I),
+     "import_error",
+     "image missing Python deps — rebuild/push cybersec-dask (no pip air-gap)"),
+    (re.compile(r"Invalid bucket name|NoSuchBucket|S3.*AccessDenied|403 Forbidden.*[Ss]3|"
+                r"Unable to locate credentials|Could not connect to the endpoint", re.I),
+     "s3_auth_or_bucket",
+     "S3 path/creds — check ConfigMap S3_BUCKET + Secret keys; config-only rem"),
+    (re.compile(r"Address already in use|EADDRINUSE|bind.*98", re.I),
+     "port_in_use",
+     "port conflict — recycle pod; if persists, check hostNetwork/NodePort clash"),
+    (re.compile(r"OOM|MemoryError|Cannot allocate memory|heap out of memory", re.I),
+     "oom",
+     "memory pressure — cap workers (T4.workers-capacity) or raise limits"),
+    (re.compile(r"Permission denied|EACCES|Read-only file system", re.I),
+     "permission",
+     "filesystem perms — hostPath/spill/registry mode (chmod 0777 registry path)"),
+    (re.compile(r"Connection refused|Name or service not known|Temporary failure in name|"
+                r"nodename nor servname|Failed to resolve", re.I),
+     "dns_or_connect",
+     "in-cluster DNS/service — check endpoints + coredns; wait for deps Ready"),
+    (re.compile(r"SSL|certificate verify failed|x509|TLS", re.I),
+     "tls",
+     "TLS/cert issue — air-gap often needs verify=false or correct CA bundle"),
+    (re.compile(r"Panel|Bokeh|tornado|WebSocket|ghostty", re.I),
+     "panel_ui",
+     "Panel/Bokeh/WS stack — check BOKEH_RESOURCES=server and /ws ingress"),
+    (re.compile(r"Traceback \(most recent call last\)", re.I),
+     "python_traceback",
+     "Python crash — see IN SITU LOG excerpt below for the exception type"),
+    (re.compile(r"FATAL|panic:|runtime error:|segmentation fault", re.I),
+     "fatal",
+     "process fatal — excerpt below; often OOM or bad binary/arch"),
+    (re.compile(r"Error:|Exception:|FAILED|critical", re.I),
+     "generic_error",
+     "error line in logs — see IN SITU LOG excerpt"),
+)
+
+
+def _container_crashy(cs: dict) -> bool:
+    waiting = ((cs.get("state") or {}).get("waiting") or {})
+    if waiting.get("reason") in ("CrashLoopBackOff", "CreateContainerConfigError",
+                                   "RunContainerError"):
+        return True
+    term = ((cs.get("state") or {}).get("terminated") or {})
+    if term.get("reason") in ("OOMKilled", "Error", "ContainerCannotRun"):
+        return True
+    last = ((cs.get("lastState") or {}).get("terminated") or {})
+    if last.get("reason") in ("OOMKilled", "Error"):
+        return True
+    rc = int(cs.get("restartCount") or 0)
+    if rc >= _RESTART_LOG_THRESHOLD and not cs.get("ready"):
+        return True
+    return False
+
+
+def _pod_needs_log_census(pod: dict) -> bool:
+    for cs in (pod.get("status") or {}).get("containerStatuses") or []:
+        if _container_crashy(cs):
+            return True
+    phase = (pod.get("status") or {}).get("phase")
+    return phase in ("Failed", "Unknown")
+
+
+def _fetch_container_log(ctx: Ctx, ns: str, pod: str, container: str,
+                         *, previous: bool = False) -> str:
+    args = ["logs", "-n", ns, pod, f"--tail={_LOG_TAIL_LINES}", f"-c={container}"]
+    if previous:
+        args.append("--previous")
+    r = ctx.k(args, timeout=30)
+    text = Ctx.out_text(r.stdout) if r.returncode == 0 else ""
+    if not text.strip() and not previous:
+        # CrashLoop often needs the previous terminated instance
+        return _fetch_container_log(ctx, ns, pod, container, previous=True)
+    return text
+
+
+def _classify_log_text(text: str) -> List[dict]:
+    """Return unique findings [{id, hint, evidence}] from a log tail."""
+    found: List[dict] = []
+    seen = set()
+    if not text:
+        return found
+    for line in text.splitlines():
+        s = line.strip()
+        if not s or len(s) > 400:
+            s = s[:400]
+        # Never echo lines that look like secret material
+        if re.search(r"(SECRET|PASSWORD|TOKEN|AWS_SECRET|AKIA[0-9A-Z]{16})\s*[=:]",
+                     s, re.I):
+            continue
+        for pat, fid, hint in _LOG_FINDINGS:
+            if fid in seen:
+                continue
+            if pat.search(s):
+                seen.add(fid)
+                found.append({
+                    "id": fid,
+                    "hint": hint,
+                    "evidence": s[:200],
+                })
+                break
+    return found
+
+
+def _crash_log_census(ctx: Ctx, ns: str, selector: str) -> List[str]:
+    """In-situ log facts for crashy pods under selector (closed-world only).
+
+    Returns human lines for detect detail / LIVE STATE — never secret values.
+    """
+    lines: List[str] = []
+    pods = ctx.items("pods", ns=ns, selector=selector)
+    crashy = [p for p in pods if _pod_needs_log_census(p)]
+    if not crashy:
+        return lines
+    lines.append("IN SITU LOG (engine-sampled; not exfiltrated):")
+    for p in crashy[:3]:  # bound work
+        pname = (p.get("metadata") or {}).get("name", "?")
+        statuses = (p.get("status") or {}).get("containerStatuses") or []
+        containers = [cs for cs in statuses if _container_crashy(cs)]
+        if not containers:
+            containers = statuses[:1]
+        for cs in containers[:2]:
+            cname = cs.get("name") or "main"
+            waiting = ((cs.get("state") or {}).get("waiting") or {})
+            reason = waiting.get("reason") or (
+                ((cs.get("lastState") or {}).get("terminated") or {}).get("reason")
+                or "crash")
+            lines.append(
+                f"  {ns}/{pname}:{cname} reason={reason} "
+                f"restarts={cs.get('restartCount', 0)}")
+            text = _fetch_container_log(ctx, ns, pname, cname)
+            findings = _classify_log_text(text)
+            if findings:
+                for f in findings[:5]:
+                    lines.append(f"    FINDING [{f['id']}]: {f['hint']}")
+                    lines.append(f"      evidence: {f['evidence']}")
+            else:
+                # Last non-empty lines as raw evidence (scrubbed)
+                raw = [ln.strip() for ln in text.splitlines() if ln.strip()]
+                raw = [ln for ln in raw
+                       if not re.search(
+                           r"(SECRET|PASSWORD|TOKEN|AWS_SECRET)\s*[=:]", ln, re.I)]
+                for ln in raw[-4:]:
+                    lines.append(f"      log: {ln[:180]}")
+            if not text.strip():
+                lines.append("      log: (empty — try: kubectl -n %s logs %s -c %s "
+                             "--previous --tail=80)" % (ns, pname, cname))
+    return lines
+
+
 def _pod_container_issues(pod: dict, *, expect_containers: int = 0) -> List[str]:
     """Per-container waiting/terminated reasons + ready-count mismatch."""
     issues: List[str] = []
@@ -1334,8 +2854,14 @@ def _pod_container_issues(pod: dict, *, expect_containers: int = 0) -> List[str]
         if term.get("reason") == "OOMKilled":
             issues.append(f"{cname}: OOMKilled")
         last = ((cs.get("lastState") or {}).get("terminated") or {})
+        # Historical OOM: only fail when flapping or not ready. A single past OOM
+        # with Ready + low restarts was driving full zarf redeploys (converge-24/25:
+        # ready 1/1 + lastState OOMKilled → --retries 10 / 7200s). Memory rem
+        # still runs via _rem_engine_oom when limits are below target.
         if last.get("reason") == "OOMKilled":
-            issues.append(f"{cname}: lastState OOMKilled (restarts={cs.get('restartCount', 0)})")
+            rc = int(cs.get("restartCount") or 0)
+            if not cs.get("ready") or rc >= 3:
+                issues.append(f"{cname}: lastState OOMKilled (restarts={rc})")
         if (cs.get("restartCount") or 0) >= 5 and not cs.get("ready"):
             issues.append(f"{cname}: restartCount={cs.get('restartCount')} not ready")
     # no statuses yet while Running → still starting
@@ -1344,8 +2870,8 @@ def _pod_container_issues(pod: dict, *, expect_containers: int = 0) -> List[str]
     return issues
 
 
-def _panel_workload_issues(ctx: Ctx, selector: str, *, expect_containers: int = 0
-                           ) -> List[str]:
+def _panel_workload_issues(ctx: Ctx, selector: str, *, expect_containers: int = 0,
+                           sample_logs: bool = True) -> List[str]:
     issues: List[str] = []
     if not ctx.exists("namespace", _PANEL_NS):
         return [f"{_PANEL_NS} namespace absent"]
@@ -1361,11 +2887,17 @@ def _panel_workload_issues(ctx: Ctx, selector: str, *, expect_containers: int = 
         return issues
     if ctx.pod_image_missing(_PANEL_NS, selector) is True:
         issues.append("ImagePullBackOff/ErrImagePull — image not in closed-world registry")
+    crashy = False
     for p in pods:
         issues.extend(_pod_container_issues(p, expect_containers=expect_containers))
+        if _pod_needs_log_census(p):
+            crashy = True
     drift = _image_drift(ctx, _PANEL_NS, selector)
     if drift:
         issues.append(drift)
+    # Pull logs in-situ when crash/restart — facts stay on the operator console
+    if sample_logs and crashy:
+        issues.extend(_crash_log_census(ctx, _PANEL_NS, selector))
     return issues
 
 
@@ -1441,9 +2973,17 @@ def _panel_live_state(ctx: Ctx) -> str:
         ("app=navigator-engine", "navigator-engine", 1),
     ):
         ready, total = ctx.pods_ready(_PANEL_NS, sel)
-        issues = _panel_workload_issues(ctx, sel, expect_containers=n_expect)
+        # sample_logs=False here — append census once below to avoid double fetch
+        issues = _panel_workload_issues(
+            ctx, sel, expect_containers=n_expect, sample_logs=False)
+        short = [i for i in issues if not i.startswith("IN SITU") and not i.startswith("  ")]
         lines.append(f"  {label}: ready {ready}/{total}"
-                     + (f"  issues=[{'; '.join(issues[:3])}]" if issues else "  OK"))
+                     + (f"  issues=[{'; '.join(short[:3])}]" if short else "  OK"))
+    # In-situ log census for crashy panel pods (facts stay on the operator console)
+    for sel in ("app=otel-navigator", "app=navigator-engine"):
+        log_lines = _crash_log_census(ctx, _PANEL_NS, sel)
+        if log_lines:
+            lines.extend(log_lines)
 
     s3i = _panel_s3_config_issue(ctx)
     if s3i:
@@ -1457,9 +2997,48 @@ def _panel_live_state(ctx: Ctx) -> str:
                          "(--creds-file) then converge --apply")
     else:
         lines.append("  config verdict: CM/Secret look populated")
+        # Pod env may lag Secret (no restart) — lengths/host only, never values.
+        pod_env = _pod_s3_env_census(ctx)
+        if pod_env:
+            lines.append(
+                f"  pod S3 env: endpoint_set={pod_env.get('endpoint_set')} "
+                f"host={pod_env.get('endpoint_host') or '—'} "
+                f"akid_len={pod_env.get('akid_len')} "
+                f"secret_len={pod_env.get('secret_len')} "
+                f"tcp_ok={pod_env.get('tcp_ok')}"
+                + (f" err={pod_env.get('error')}" if pod_env.get("error") else "")
+            )
+            if pod_env.get("endpoint_set") is False:
+                lines.append("  ⚠ Secret has keys but pod S3_ENDPOINT empty — "
+                             "rollout restart otel-navigator + navigator-engine")
+            elif pod_env.get("tcp_ok") is False:
+                lines.append("  ⚠ pod cannot TCP to S3_ENDPOINT host — "
+                             "fix network / endpoint URL (not creds quoting)")
         lines.append("  next: bash zarf/scripts/verify-s3-datapath.sh  "
                      "(auth + marker + span parquet)")
     return "\n".join(lines)
+
+
+def _pod_s3_env_census(ctx: Ctx) -> dict:
+    """In-pod AWS_*/S3_ENDPOINT presence + TCP reachability (no secret values)."""
+    target = None
+    if ctx.pods_ready(_PANEL_NS, "app=otel-navigator")[0] >= 1:
+        target = (_PANEL_NS, "deploy/otel-navigator", ["-c", "otel-navigator"])
+    elif ctx.pods_ready("dask", "dask.org/component=scheduler")[0] >= 1:
+        target = ("dask", "deploy/cybersec-dask-scheduler", [])
+    if not target:
+        return {}
+    ns, res, extra = target
+    r = ctx.run(
+        ctx.kubectl + ["exec", "-n", ns, res] + extra + ["--", "python3", "-c", _S3_POD_ENV_PY],
+        timeout=20,
+    )
+    raw = (r.stdout or "").strip()
+    try:
+        data = json.loads(raw.splitlines()[-1]) if raw else {}
+        return data if isinstance(data, dict) else {}
+    except json.JSONDecodeError:
+        return {"error": f"pod env census unparseable rc={r.returncode}"}
 
 
 def _panel_deployments_exist(ctx: Ctx) -> bool:
@@ -1637,10 +3216,21 @@ def _rem_otel_navigator(ctx: Ctx) -> Fix:
         if cap_fix.changed:
             actions.append(cap_fix.detail)
 
+    # Image drift — surgical retarget (do not recycle-only; converge-11/12)
+    if any("image drift" in w for w in workload):
+        actions.extend(_rem_panel_image_drift(
+            ctx, "otel-navigator", "cybersec-images,panel-viz"))
+
     if needs_package or _panel_s3_config_issue(ctx) or not _det_otel_navigator(ctx).ok:
         if ctx.have_zarf() and ctx.package_path:
-            fix = _zarf_deploy_components(ctx, "cybersec-images,panel-viz")
-            actions.append(fix.detail)
+            # Skip full package if image-drift path already ran a deploy
+            if not any("panel-viz" in a or "retargeted" in a for a in actions):
+                fix = _zarf_deploy_components(ctx, "cybersec-images,panel-viz")
+                actions.append(fix.detail)
+                if any("image drift" in w for w in workload):
+                    actions.extend(_retarget_deployments_cybersec(
+                        ctx, _PANEL_NS, "app=otel-navigator"))
+                    actions.extend(_recycle_panel_pods(ctx, "app=otel-navigator"))
         elif _panel_s3_config_issue(ctx) and ctx.s3.get("S3_BUCKET"):
             # No package — config-only is the only lever
             cfg = _patch_panel_s3_config(ctx)
@@ -1653,7 +3243,12 @@ def _rem_otel_navigator(ctx: Ctx) -> Fix:
 
     re = _det_otel_navigator(ctx)
     if not re.ok:
-        actions.extend(_recycle_panel_pods(ctx, "app=otel-navigator"))
+        if any("image drift" in w for w in _panel_workload_issues(
+                ctx, "app=otel-navigator", expect_containers=2)):
+            actions.extend(_rem_panel_image_drift(
+                ctx, "otel-navigator", "cybersec-images,panel-viz"))
+        else:
+            actions.extend(_recycle_panel_pods(ctx, "app=otel-navigator"))
         if (ctx.have_zarf() and ctx.package_path
                 and not any("panel-viz" in a for a in actions)):
             fix2 = _zarf_deploy_components(ctx, "panel-viz")
@@ -1680,6 +3275,111 @@ def _rem_otel_navigator(ctx: Ctx) -> Fix:
                    _manual.hint_for("T5.otel-navigator")))
 
 
+# Engine OOM target (field: 2Gi/4Gi OOMs when binding Dask frames — converge-24/25).
+_ENGINE_MEM_REQUEST = "4Gi"
+_ENGINE_MEM_LIMIT = "8Gi"
+
+
+def _parse_mem_to_mi(val: str) -> Optional[int]:
+    """Parse K8s memory quantity to MiB (approx). None if unparseable."""
+    if not val:
+        return None
+    s = str(val).strip()
+    try:
+        if s.endswith("Ki"):
+            return int(float(s[:-2]) / 1024)
+        if s.endswith("Mi"):
+            return int(float(s[:-2]))
+        if s.endswith("Gi"):
+            return int(float(s[:-2]) * 1024)
+        if s.endswith("Ti"):
+            return int(float(s[:-2]) * 1024 * 1024)
+        if s.endswith("m"):  # milli-bytes — ignore
+            return None
+        return int(float(s) / (1024 * 1024))
+    except ValueError:
+        return None
+
+
+def _engine_had_oom(ctx: Ctx) -> bool:
+    for p in ctx.items("pods", ns=_PANEL_NS, selector="app=navigator-engine"):
+        for cs in ((p.get("status") or {}).get("containerStatuses") or []):
+            term = ((cs.get("state") or {}).get("terminated") or {})
+            last = ((cs.get("lastState") or {}).get("terminated") or {})
+            if term.get("reason") == "OOMKilled" or last.get("reason") == "OOMKilled":
+                return True
+    return False
+
+
+def _engine_memory_below_target(ctx: Ctx) -> Optional[str]:
+    """None if deploy missing or already at/above target; else short reason."""
+    dep = ctx.get("deploy", "navigator-engine", ns=_PANEL_NS) or ctx.get(
+        "deployment", "navigator-engine", ns=_PANEL_NS)
+    if not dep:
+        return None
+    containers = (
+        ((dep.get("spec") or {}).get("template") or {}).get("spec") or {}
+    ).get("containers") or []
+    for c in containers:
+        if c.get("name") != "navigator-engine":
+            continue
+        res = c.get("resources") or {}
+        lim = ((res.get("limits") or {}).get("memory")) or ""
+        req = ((res.get("requests") or {}).get("memory")) or ""
+        lim_mi = _parse_mem_to_mi(lim) or 0
+        req_mi = _parse_mem_to_mi(req) or 0
+        want_lim = _parse_mem_to_mi(_ENGINE_MEM_LIMIT) or 8192
+        want_req = _parse_mem_to_mi(_ENGINE_MEM_REQUEST) or 4096
+        if lim_mi < want_lim or req_mi < want_req:
+            return (f"navigator-engine memory req={req or '?'} lim={lim or '?'} "
+                    f"(target {_ENGINE_MEM_REQUEST}/{_ENGINE_MEM_LIMIT})")
+        return None
+    return None
+
+
+def _rem_engine_oom_memory(ctx: Ctx) -> Fix:
+    """Surgical memory bump on navigator-engine Deployment — no zarf package."""
+    if not (ctx.exists("deploy", "navigator-engine", ns=_PANEL_NS)
+            or ctx.exists("deployment", "navigator-engine", ns=_PANEL_NS)):
+        return Fix(False, "navigator-engine Deployment absent")
+    patch = {
+        "spec": {
+            "template": {
+                "spec": {
+                    "containers": [{
+                        "name": "navigator-engine",
+                        "resources": {
+                            "requests": {
+                                "cpu": "500m",
+                                "memory": _ENGINE_MEM_REQUEST,
+                            },
+                            "limits": {
+                                "cpu": "2",
+                                "memory": _ENGINE_MEM_LIMIT,
+                            },
+                        },
+                    }]
+                }
+            }
+        }
+    }
+    r = ctx.k([
+        "patch", "deployment", "navigator-engine", "-n", _PANEL_NS,
+        "--type", "strategic", "-p", json.dumps(patch),
+    ])
+    if r.returncode != 0:
+        return Fix(False, f"patch memory failed: {(r.stderr or r.stdout or '')[:200]}")
+    actions = [
+        f"patched navigator-engine memory → {_ENGINE_MEM_REQUEST}/{_ENGINE_MEM_LIMIT}",
+    ]
+    rr = ctx.k(["rollout", "restart", "deployment/navigator-engine", "-n", _PANEL_NS])
+    if rr.returncode == 0:
+        actions.append("rollout restart deployment/navigator-engine")
+    else:
+        actions.extend(_recycle_panel_pods(ctx, "app=navigator-engine"))
+    return Fix(True, "; ".join(actions))
+
+
 def _det_engine(ctx: Ctx) -> Probe:
     live = _panel_live_state(ctx)
     s3i = _panel_s3_config_issue(ctx)
@@ -1689,6 +3389,10 @@ def _det_engine(ctx: Ctx) -> Probe:
     # (dataset commands / S3 listing via Dask).
     if s3i and total > 0:
         return Probe(False, f"{s3i}; engine ready {ready}/{total}\n{live}")
+    # OOM history with undersized limits → fail so rem bumps memory (even if Ready).
+    mem = _engine_memory_below_target(ctx)
+    if mem and _engine_had_oom(ctx):
+        return Probe(False, f"OOM with undersized limits: {mem}\n{live}")
     if issues:
         return Probe(False, f"{'; '.join(issues[:4])}\n{live}")
     if ready < 1:
@@ -1697,8 +3401,13 @@ def _det_engine(ctx: Ctx) -> Probe:
 
 
 def _rem_engine(ctx: Ctx) -> Fix:
-    """Heal navigator-engine. Prefer config-only patch of shared S3 when that is
-    the only failure; otherwise zarf deploy navigator-engine (+ panel-viz if needed)."""
+    """Heal navigator-engine. Prefer lightest change:
+
+    1. Shared S3 config-only patch
+    2. **Surgical memory bump** on OOM (converge-24/25 — not full zarf redeploy)
+    3. Image-drift retarget
+    4. zarf deploy only if deploy missing / drift / above insufficient
+    """
     actions: List[str] = []
     s3i = _panel_s3_config_issue(ctx)
     if s3i and not ctx.s3.get("S3_BUCKET"):
@@ -1710,23 +3419,44 @@ def _rem_engine(ctx: Ctx) -> Fix:
         actions.append(cfg.detail)
         if _panel_s3_config_issue(ctx) is None and _det_engine(ctx).ok:
             return Fix(True, " | ".join(actions))
-    if s3i and ctx.s3.get("S3_BUCKET") and ctx.have_zarf() and ctx.package_path:
-        pf = _zarf_deploy_components(ctx, "cybersec-images,panel-viz")
-        actions.append(f"panel-viz (S3 config): {pf.detail}")
-    if ctx.have_zarf() and ctx.package_path:
-        fix = _zarf_deploy_components(ctx, "cybersec-images,navigator-engine")
+    # OOM → raise limits before expensive package deploy
+    if _engine_had_oom(ctx) and _engine_memory_below_target(ctx):
+        oom = _rem_engine_oom_memory(ctx)
+        actions.append(oom.detail)
+        if oom.changed and _det_engine(ctx).ok:
+            return Fix(True, " | ".join(actions))
+    # Image drift first (cheap surgical) before full chart redeploy
+    if _image_drift(ctx, _PANEL_NS, "app=navigator-engine"):
+        actions.extend(_rem_panel_image_drift(
+            ctx, "navigator-engine", "cybersec-images,navigator-engine"))
+        if _det_engine(ctx).ok:
+            return Fix(True, " | ".join(actions))
+    # Deploy missing entirely
+    eng_exists = (
+        ctx.exists("deploy", "navigator-engine", ns=_PANEL_NS)
+        or ctx.exists("deployment", "navigator-engine", ns=_PANEL_NS)
+    )
+    if not eng_exists and ctx.have_zarf() and ctx.package_path:
+        # Images usually already present — try engine-only first (shorter timeout)
+        fix = _zarf_deploy_components(ctx, "navigator-engine")
         actions.append(fix.detail)
-    elif not actions:
+        if not fix.changed or not _det_engine(ctx).ok:
+            fix2 = _zarf_deploy_components(ctx, "cybersec-images,navigator-engine")
+            actions.append(fix2.detail)
+    elif not eng_exists and not actions:
         return Fix(False, _manual.join_detail(
             f"MANUAL: cannot deploy navigator-engine without package\n{_panel_live_state(ctx)}",
             _manual.hint_for("T5.navigator-engine")))
+    elif not _det_engine(ctx).ok:
+        # Still unhealthy: recycle; avoid full package redeploy for OOM/Ready cases
+        if _engine_had_oom(ctx) and _engine_memory_below_target(ctx):
+            actions.append(_rem_engine_oom_memory(ctx).detail)
+        else:
+            actions.extend(_recycle_panel_pods(ctx, "app=navigator-engine"))
     re = _det_engine(ctx)
-    if not re.ok:
-        actions.extend(_recycle_panel_pods(ctx, "app=navigator-engine"))
-    re = _det_engine(ctx)
-    detail = " | ".join(actions)
+    detail = " | ".join(a for a in actions if a)
     if re.ok:
-        return Fix(True, detail)
+        return Fix(True, detail or "navigator-engine already healthy")
     return Fix(bool(actions),
                _manual.join_detail(
                    f"{detail}; still: {re.detail.splitlines()[0]}; "
@@ -1745,53 +3475,127 @@ def _rem_engine(ctx: Ctx) -> Fix:
 _S3_DATAPATH_SCRIPT = Path(__file__).resolve().parent.parent / "scripts" / "verify-s3-datapath.sh"
 
 # Compact in-pod probe (mirrors verify-s3-datapath.sh / otel-navigator loader).
+# TCP precheck + short botocore timeouts — field hang was empty/wrong endpoint
+# with 180s silent wait (converge-26).
 _S3_DATAPATH_PY = r"""
-import json, os, sys
+import json, os, sys, socket, urllib.parse
 bucket = (os.environ.get("S3_BUCKET") or "").strip()
 akid = os.environ.get("AWS_ACCESS_KEY_ID") or ""
 secret = os.environ.get("AWS_SECRET_ACCESS_KEY") or ""
 endpoint = (os.environ.get("S3_ENDPOINT") or "").strip()
 region = (os.environ.get("AWS_REGION") or "us-east-1").strip()
-out = {"ok": False, "bucket": bucket, "akid_len": len(akid), "endpoint_set": bool(endpoint)}
+out = {"ok": False, "bucket": bucket, "akid_len": len(akid),
+       "endpoint_set": bool(endpoint),
+       "endpoint_host": endpoint.split("://")[-1].split("/")[0] if endpoint else ""}
 if not bucket:
     out["error"] = "S3_BUCKET empty in pod"; print(json.dumps(out)); sys.exit(1)
 if not akid or not secret:
     out["error"] = "AWS keys empty in pod env"; print(json.dumps(out)); sys.exit(1)
+if not endpoint:
+    out["error"] = ("S3_ENDPOINT empty in pod env — Secret may have the key but "
+                    "container was not restarted; rollout restart panel + engine")
+    print(json.dumps(out)); sys.exit(1)
+# Fail fast on network before s3fs can hang for minutes
+try:
+    u = urllib.parse.urlparse(endpoint)
+    host = u.hostname or ""
+    port = u.port or (443 if (u.scheme or "https") == "https" else 80)
+    out["endpoint_host"] = host
+    out["endpoint_port"] = port
+    s = socket.create_connection((host, port), timeout=5)
+    s.close()
+    out["tcp_ok"] = True
+except Exception as e:
+    out["tcp_ok"] = False
+    out["error"] = f"TCP to S3_ENDPOINT failed: {type(e).__name__}: {e}"
+    print(json.dumps(out)); sys.exit(1)
 import s3fs
-kw = {"key": akid, "secret": secret,
-      "client_kwargs": {"endpoint_url": endpoint or None, "region_name": region}}
-if endpoint:
-    kw["config_kwargs"] = {"s3": {"addressing_style": "path"}}
+# config_kwargs only — not client_kwargs["config"] (duplicate config → TypeError)
+kw = {
+    "key": akid, "secret": secret,
+    "client_kwargs": {"endpoint_url": endpoint, "region_name": region},
+    "config_kwargs": {
+        "s3": {"addressing_style": "path"},
+        "connect_timeout": 5, "read_timeout": 20,
+        "retries": {"max_attempts": 2, "mode": "standard"},
+    },
+}
 tok = os.environ.get("AWS_SESSION_TOKEN") or ""
 if tok:
     kw["token"] = tok
+socket.setdefaulttimeout(30)
 fs = s3fs.S3FileSystem(**kw)
 try:
     fs.ls(bucket)
 except Exception as e:
     out["error"] = f"list bucket: {type(e).__name__}: {e}"; print(json.dumps(out)); sys.exit(1)
+# Data root: marker dataset and/or OTEL_DATA_PATH. Parquet lives under
+# {root}/spans/ with partitions (date=/hour= or shard=/date=) — never only
+# at the top level of OTEL_DATA_PATH (field: s3://dhfo/otel-notebook/spans/…).
+cfg = (os.environ.get("OTEL_DATA_PATH") or os.environ.get("CHECK_CFG_PATH") or "").strip()
+roots = []
 mk = f"{bucket}/_active_dataset.json"
-if not fs.exists(mk):
-    out["error"] = f"marker missing s3://{mk}"; print(json.dumps(out)); sys.exit(1)
-with fs.open(mk, "r") as f:
-    marker = json.load(f)
-ds = marker.get("dataset") or marker.get("prefix")
-if not ds:
-    out["error"] = "marker has no dataset"; print(json.dumps(out)); sys.exit(1)
-files = []
-for pat in (f"{bucket}/{ds}/spans/**/*.parquet",
-            f"{bucket}/{ds}/**/spans/**/*.parquet",
-            f"{bucket}/{ds}/**/*.parquet"):
+if fs.exists(mk):
+    with fs.open(mk, "r") as f:
+        marker = json.load(f)
+    ds = (marker.get("dataset") or marker.get("prefix") or "").strip().strip("/")
+    if ds:
+        roots.append(f"{bucket}/{ds}")
+        out["dataset"] = ds
+    else:
+        out["marker_warning"] = "no dataset key"
+else:
+    out["marker_warning"] = f"missing {mk}"
+if cfg.startswith("s3://"):
+    root = cfg[5:].strip("/")
+    if root and root != bucket and root not in roots:
+        roots.append(root)
+if not roots:
+    out["error"] = "no data root (marker dataset and/or OTEL_DATA_PATH prefix)"
+    print(json.dumps(out)); sys.exit(1)
+
+def find_span_pq(data_root):
+    spans = data_root.rstrip("/") + "/spans"
+    for pat in (
+        spans + "/shard=*/date=*/batch_*.parquet",
+        spans + "/shard=*/date=*/*.parquet",
+        spans + "/date=*/hour=*/*.parquet",
+        spans + "/date=*/*.parquet",
+    ):
+        try:
+            hits = [h for h in (fs.glob(pat) or []) if str(h).endswith(".parquet")]
+        except Exception:
+            hits = []
+        if hits:
+            return hits, spans, "glob:" + pat
     try:
-        files = list(fs.glob(pat)) or []
+        if fs.exists(spans):
+            hits = [e for e in fs.find(spans) if str(e).endswith(".parquet")]
+            if hits:
+                return hits, spans, "find:" + spans
     except Exception:
-        files = []
-    if files:
+        pass
+    return [], spans, None
+
+files, spans_path, method = [], None, None
+for root in roots:
+    hits, sp, method = find_span_pq(root)
+    if hits:
+        files, spans_path = hits, sp
+        out["dataset_path"] = "s3://" + root.rstrip("/") + "/"
+        out["spans_path"] = "s3://" + sp + "/"
+        out["glob_pattern"] = method
+        if "dataset" not in out:
+            out["dataset"] = root[len(bucket):].lstrip("/") if root.startswith(bucket) else root
         break
-out["dataset"] = ds
 out["parquet_count"] = len(files)
 if not files:
-    out["error"] = f"no parquet under s3://{bucket}/{ds}/"; print(json.dumps(out)); sys.exit(1)
+    out["error"] = (
+        f"no parquet under s3://{roots[0]}/spans/ "
+        f"(need spans/date=*/hour=*/*.parquet or spans/shard=*/date=*/*.parquet; "
+        f"top-level of OTEL_DATA_PATH is not enough)"
+    )
+    print(json.dumps(out)); sys.exit(1)
 with fs.open(files[0], "rb") as f:
     f.read(64)
 out["ok"] = True
@@ -1799,43 +3603,67 @@ out["sample"] = files[0]
 print(json.dumps(out))
 """
 
+# Fast pod env + TCP only (LIVE STATE / pre-s3fs gate). No secrets printed.
+_S3_POD_ENV_PY = r"""
+import json, os, socket, urllib.parse
+ep = (os.environ.get("S3_ENDPOINT") or "").strip()
+out = {
+  "bucket": (os.environ.get("S3_BUCKET") or "").strip(),
+  "endpoint_set": bool(ep),
+  "endpoint_host": ep.split("://")[-1].split("/")[0] if ep else "",
+  "endpoint_len": len(ep),
+  "akid_len": len(os.environ.get("AWS_ACCESS_KEY_ID") or ""),
+  "secret_len": len(os.environ.get("AWS_SECRET_ACCESS_KEY") or ""),
+  "tcp_ok": None, "error": "",
+}
+if not ep:
+    out["error"] = "S3_ENDPOINT empty in pod"
+    print(json.dumps(out)); raise SystemExit(0)
+try:
+    u = urllib.parse.urlparse(ep)
+    host = u.hostname or out["endpoint_host"]
+    port = u.port or (443 if (u.scheme or "https") == "https" else 80)
+    out["endpoint_host"] = host
+    s = socket.create_connection((host, port), timeout=5)
+    s.close()
+    out["tcp_ok"] = True
+except Exception as e:
+    out["tcp_ok"] = False
+    out["error"] = f"{type(e).__name__}: {e}"
+print(json.dumps(out))
+"""
 
-def _det_s3_datapath(ctx: Ctx) -> Probe:
-    """Configured bucket reachable from the app pod; marker + span parquet readable.
 
-    Data is operator-provided (or notebook-generated) — engine never fetches.
-    Failures are MANUAL (fix endpoint/creds, or seed spans under the marker path).
+def _parse_s3_datapath_json(raw: str) -> dict:
+    """Extract probe JSON from script/kubectl stdout (tolerate warnings / pretty print).
+
+    Field failure mode: host-side ``json.loads`` on empty or mixed output made
+    T5.s3-datapath FAIL with a JSONDecodeError even when S3 was fine (script
+    bug: kubectl exec without -i → empty RESULT).
     """
-    s3i = _panel_s3_config_issue(ctx)
-    if s3i:
-        return Probe(False, s3i)
+    text = (raw or "").strip()
+    if not text:
+        return {}
+    # Prefer last complete JSON object line (script prints one; json.tool may
+    # expand to multi-line — then fall through to full-text parse).
+    for line in reversed(text.splitlines()):
+        line = line.strip()
+        if line.startswith("{") and line.endswith("}"):
+            try:
+                data = json.loads(line)
+                if isinstance(data, dict):
+                    return data
+            except json.JSONDecodeError:
+                continue
+    try:
+        data = json.loads(text)
+        return data if isinstance(data, dict) else {}
+    except json.JSONDecodeError:
+        return {}
 
-    # Prefer the staged script (full diagnosis, human + --json).
-    if _S3_DATAPATH_SCRIPT.is_file():
-        import subprocess
-        env = {**os.environ}
-        r = subprocess.run(
-            ["bash", str(_S3_DATAPATH_SCRIPT), "--quiet", "--json"],
-            capture_output=True, text=True, timeout=180, env=env,
-        )
-        raw = (r.stdout or "").strip() or (r.stderr or "").strip()
-        try:
-            # last JSON object in output
-            line = raw.strip().splitlines()[-1] if raw else "{}"
-            data = json.loads(line)
-        except (json.JSONDecodeError, IndexError):
-            data = {}
-        if r.returncode == 0 and data.get("ok"):
-            m = data.get("marker") or {}
-            return Probe(
-                True,
-                f"S3 OK bucket={data.get('bucket_configmap')} "
-                f"dataset={m.get('dataset')} parquet={data.get('parquet_count')}",
-            )
-        err = data.get("error") or raw[-300:] or f"verify-s3-datapath rc={r.returncode}"
-        return Probe(False, f"S3 datapath: {err}\n{_panel_live_state(ctx)}")
 
-    # Fallback: kubectl exec into otel-navigator (or dask scheduler).
+def _det_s3_datapath_inline(ctx: Ctx) -> Probe:
+    """kubectl exec python3 -c probe (no bash script / no stdin heredoc)."""
     target = None  # (ns, resource, extra_args)
     if ctx.pods_ready(_PANEL_NS, "app=otel-navigator")[0] >= 1:
         target = (_PANEL_NS, "deploy/otel-navigator", ["-c", "otel-navigator"])
@@ -1846,77 +3674,427 @@ def _det_s3_datapath(ctx: Ctx) -> Probe:
                      f"no Ready otel-navigator or dask scheduler to probe S3\n"
                      f"{_panel_live_state(ctx)}")
     ns, res, extra = target
+    # 75s wall: TCP 5s + s3fs with botocore 20s reads — never wait 180s silent
     r = ctx.run(
         ctx.kubectl + ["exec", "-n", ns, res] + extra + ["--", "python3", "-c", _S3_DATAPATH_PY],
-        timeout=120,
+        timeout=75,
     )
     raw = (r.stdout or "").strip()
-    try:
-        data = json.loads(raw.splitlines()[-1]) if raw else {}
-    except json.JSONDecodeError:
-        data = {}
+    data = _parse_s3_datapath_json(raw)
     if r.returncode == 0 and data.get("ok"):
         return Probe(
             True,
             f"S3 OK bucket={data.get('bucket')} dataset={data.get('dataset')} "
-            f"parquet={data.get('parquet_count')}",
+            f"parquet={data.get('parquet_count')} host={data.get('endpoint_host')}",
         )
     err = data.get("error") or (r.stderr or raw or f"rc={r.returncode}")[-300:]
+    if r.returncode == 124 or (isinstance(err, str) and err.strip() == "timeout"):
+        err = ("probe timed out after TCP/s3fs budgets — S3_ENDPOINT host unreachable "
+               "or list hang; see pod S3 env in LIVE STATE")
     return Probe(False, f"S3 datapath: {err}\n{_panel_live_state(ctx)}")
 
 
+def _det_s3_datapath(ctx: Ctx) -> Probe:
+    """Configured bucket reachable from the app pod; marker + span parquet readable.
+
+    Data is operator-provided (or notebook-generated) — engine never fetches.
+    Failures are MANUAL (fix endpoint/creds, or seed spans under the marker path).
+
+    Prefer staged verify-s3-datapath.sh; on empty/non-JSON or script timeout,
+    fall back to inline kubectl exec so a script plumbing bug cannot brick
+    converge when the datapath is actually healthy.
+    """
+    s3i = _panel_s3_config_issue(ctx)
+    if s3i:
+        return Probe(False, s3i)
+
+    # Fast gate: pod env + TCP before multi-minute s3fs (converge-26 hang).
+    pod_env = _pod_s3_env_census(ctx)
+    if pod_env.get("error") and pod_env.get("endpoint_set") is False:
+        return Probe(
+            False,
+            f"S3 datapath: {pod_env.get('error')} — Secret may be set but not in "
+            f"container env; config-only rem + rollout restart\n{_panel_live_state(ctx)}",
+        )
+    if pod_env.get("tcp_ok") is False:
+        return Probe(
+            False,
+            f"S3 datapath: pod cannot reach S3_ENDPOINT host="
+            f"{pod_env.get('endpoint_host')!r} ({pod_env.get('error')}) — "
+            f"fix network/URL from cluster, not creds-file quoting\n"
+            f"{_panel_live_state(ctx)}",
+        )
+
+    # Prefer the staged script (full diagnosis, human + --json).
+    if _S3_DATAPATH_SCRIPT.is_file():
+        import subprocess
+        env = {**os.environ}
+        try:
+            r = subprocess.run(
+                ["bash", str(_S3_DATAPATH_SCRIPT), "--quiet", "--json"],
+                capture_output=True, text=True, timeout=90, env=env,
+            )
+        except subprocess.TimeoutExpired:
+            # Prefer inline (has TCP + botocore budgets) over bare timeout message
+            fb = _det_s3_datapath_inline(ctx)
+            if fb.ok:
+                return Probe(True, f"{fb.detail} (inline after script timeout)")
+            return Probe(
+                False,
+                f"S3 datapath: script timed out 90s; inline: "
+                f"{fb.detail.split(chr(10))[0]}\n{_panel_live_state(ctx)}",
+            )
+        raw = (r.stdout or "").strip() or (r.stderr or "").strip()
+        data = _parse_s3_datapath_json(raw)
+        if r.returncode == 0 and data.get("ok"):
+            m = data.get("marker") or {}
+            return Probe(
+                True,
+                f"S3 OK bucket={data.get('bucket_configmap')} "
+                f"dataset={m.get('dataset')} parquet={data.get('parquet_count')}",
+            )
+        # Empty / non-JSON / stdin-not-delivered: fall back to inline -c probe
+        # so converge is not blocked by script plumbing (field: JSONDecodeError).
+        plumbing = (
+            not data
+            or "empty probe output" in (data.get("error") or "")
+            or "non-json probe output" in (data.get("error") or "")
+            or "JSONDecodeError" in raw
+            or "Expecting value" in raw
+        )
+        if plumbing:
+            fb = _det_s3_datapath_inline(ctx)
+            if fb.ok:
+                return Probe(True, f"{fb.detail} (inline fallback; script output unusable)")
+            script_err = data.get("error") or (raw[-200:] if raw else f"rc={r.returncode}")
+            return Probe(
+                False,
+                f"S3 datapath: {fb.detail.split(chr(10))[0]} "
+                f"[script also failed: {script_err[:160]}]\n"
+                f"{_panel_live_state(ctx)}",
+            )
+        err = data.get("error") or raw[-300:] or f"verify-s3-datapath rc={r.returncode}"
+        return Probe(False, f"S3 datapath: {err}\n{_panel_live_state(ctx)}")
+
+    return _det_s3_datapath_inline(ctx)
+
+
+# JupyterHub control-plane pods (hub + proxy). Singleuser servers are user-triggered.
+_JH_NS = "jupyterhub"
+_JH_SELECTORS = ("component=hub", "component=proxy")
+
+
+def _jupyterhub_workload_census(ctx: Ctx) -> dict:
+    """Census hub/proxy pods + node schedulability — informs rem without re-deploy.
+
+    Returns keys:
+      hub_ready, hub_total, proxy_ready, proxy_total,
+      pending (list of {name, sel, phase, msgs}),
+      deploys (list of deploy names present),
+      node_schedulable (bool), node_blockers (list[str]),
+      disk_pressure (bool), summary (str one-liner for logs)
+    """
+    hub_r, hub_t = ctx.pods_ready(_JH_NS, "component=hub")
+    proxy_r, proxy_t = ctx.pods_ready(_JH_NS, "component=proxy")
+    pending: List[dict] = []
+    for sel in _JH_SELECTORS:
+        for p in ctx.items("pods", ns=_JH_NS, selector=sel):
+            phase = (p.get("status") or {}).get("phase") or "?"
+            name = (p.get("metadata") or {}).get("name") or "?"
+            if phase == "Pending" or (
+                phase == "Running"
+                and not any(
+                    c.get("type") == "Ready" and c.get("status") == "True"
+                    for c in (p.get("status") or {}).get("conditions") or []
+                )
+            ):
+                # Include not-Ready Running only when never scheduled (no nodeName)
+                node = (p.get("spec") or {}).get("nodeName")
+                if phase == "Pending" or not node:
+                    pending.append({
+                        "name": name,
+                        "sel": sel,
+                        "phase": phase,
+                        "msgs": _pod_failed_scheduling_msgs(p),
+                    })
+    deploys = []
+    for d in ctx.items("deployments", ns=_JH_NS) or []:
+        n = (d.get("metadata") or {}).get("name")
+        if n:
+            deploys.append(n)
+    # Also try apps/v1 via kind deploy
+    if not deploys:
+        for d in ctx.items("deploy", ns=_JH_NS) or []:
+            n = (d.get("metadata") or {}).get("name")
+            if n:
+                deploys.append(n)
+
+    node_blockers: List[str] = []
+    node_schedulable = True
+    for n in ctx.items("nodes"):
+        name = (n.get("metadata") or {}).get("name") or "?"
+        conds = {c.get("type"): c for c in (n.get("status") or {}).get("conditions") or []}
+        if str((conds.get("Ready") or {}).get("status", "")).lower() != "true":
+            node_blockers.append(f"{name}: NotReady")
+            node_schedulable = False
+        if str((conds.get("DiskPressure") or {}).get("status", "")).lower() == "true":
+            node_blockers.append(f"{name}: DiskPressure=True")
+            node_schedulable = False
+        if str((conds.get("MemoryPressure") or {}).get("status", "")).lower() == "true":
+            node_blockers.append(f"{name}: MemoryPressure=True")
+            node_schedulable = False
+        if n.get("spec", {}).get("unschedulable"):
+            node_blockers.append(f"{name}: cordoned")
+            node_schedulable = False
+        for t in n.get("spec", {}).get("taints", []) or []:
+            key = t.get("key") or ""
+            effect = t.get("effect") or ""
+            if effect in ("NoSchedule", "NoExecute") and "control-plane" not in key:
+                # control-plane tolerations usually present on system pods; hub may not
+                node_blockers.append(f"{name}: taint {key}:{effect}")
+                if "disk-pressure" in key or "memory-pressure" in key or "unschedulable" in key:
+                    node_schedulable = False
+
+    # Scheduling-message census (Insufficient cpu/memory, taints, etc.)
+    sched_hints: List[str] = []
+    for p in pending:
+        for m in p.get("msgs") or []:
+            if m not in sched_hints:
+                sched_hints.append(m)
+
+    parts = [
+        f"hub {hub_r}/{hub_t} Ready",
+        f"proxy {proxy_r}/{proxy_t} Ready",
+        f"pending={len(pending)}",
+        f"deploys={deploys or 'none'}",
+        f"node_schedulable={node_schedulable}",
+    ]
+    if node_blockers:
+        parts.append("blockers=[" + "; ".join(node_blockers[:4]) + "]")
+    if sched_hints:
+        parts.append("sched=[" + " | ".join(sched_hints[:3]) + "]")
+    summary = "  ".join(parts)
+
+    return {
+        "hub_ready": hub_r,
+        "hub_total": hub_t,
+        "proxy_ready": proxy_r,
+        "proxy_total": proxy_t,
+        "pending": pending,
+        "deploys": deploys,
+        "node_schedulable": node_schedulable,
+        "node_blockers": node_blockers,
+        "disk_pressure": any("DiskPressure" in b for b in node_blockers),
+        "sched_hints": sched_hints,
+        "summary": summary,
+    }
+
+
+def _recycle_jupyterhub_pending(ctx: Ctx) -> List[str]:
+    """Force-delete Pending (or unscheduled) hub/proxy pods so the scheduler retries."""
+    actions: List[str] = []
+    for sel in _JH_SELECTORS:
+        r = ctx.k([
+            "delete", "pod", "-n", _JH_NS, "-l", sel,
+            "--field-selector=status.phase=Pending",
+            "--force", "--grace-period=0", "--wait=false", "--ignore-not-found",
+        ])
+        if r.returncode == 0 and (Ctx.out_text(r.stdout) or Ctx.out_text(r.stderr)).strip():
+            actions.append(f"recycled Pending pods -l {sel}")
+        # Also pods with no nodeName stuck Running/unknown
+        for p in ctx.items("pods", ns=_JH_NS, selector=sel):
+            if (p.get("spec") or {}).get("nodeName"):
+                continue
+            name = (p.get("metadata") or {}).get("name")
+            phase = (p.get("status") or {}).get("phase")
+            if name and phase == "Pending":
+                # already covered by field-selector delete; belt
+                continue
+            if name and not (p.get("spec") or {}).get("nodeName"):
+                r2 = ctx.k([
+                    "delete", "pod", "-n", _JH_NS, name,
+                    "--force", "--grace-period=0", "--wait=false", "--ignore-not-found",
+                ])
+                if r2.returncode == 0:
+                    actions.append(f"recycled unscheduled pod {name}")
+    return actions
+
+
 def _det_jupyterhub(ctx: Ctx) -> Probe:
-    """Hub must be Ready; package uses sqlite-memory + singleuser storage none
-    (no PVC). Any jupyterhub PVC is a vestige from an older chart and a wedge."""
-    ready, total = ctx.pods_ready("jupyterhub", "component=hub")
-    pvcs = ctx.items("pvc", ns="jupyterhub")
+    """Hub Ready + proxy present when deployed; PVC vestiges and Pending census.
+
+    Package uses sqlite-memory + singleuser storage none (no PVC). Any jupyterhub
+    PVC is a vestige. Pending hub/proxy under DiskPressure is a scheduling problem
+    — not fixed by another zarf package deploy.
+    """
+    if not ctx.exists("namespace", _JH_NS):
+        return Probe(False, "jupyterhub namespace absent — need package deploy")
+
+    census = _jupyterhub_workload_census(ctx)
+    pvcs = ctx.items("pvc", ns=_JH_NS)
     if pvcs:
         names = [p.get("metadata", {}).get("name") for p in pvcs]
         phases = [p.get("status", {}).get("phase") for p in pvcs]
         return Probe(
             False,
-            f"jupyterhub hub ready {ready}/{total}; unexpected PVC(s) {names} "
-            f"phases={phases} — resilient package is sqlite-memory/storage none; "
-            "delete PVC/PV vestiges then redeploy")
-    if ready >= 1:
-        return Probe(True, f"jupyterhub hub ready {ready}/{total} (no PVC — resilient)")
-    return Probe(False, f"jupyterhub hub ready {ready}/{total}")
+            f"jupyterhub unexpected PVC(s) {names} phases={phases} — "
+            f"resilient package is sqlite-memory/storage none; "
+            f"census: {census['summary']}",
+        )
+
+    hub_ok = census["hub_ready"] >= 1
+    # Proxy is required when deploys exist; if only hub chart partial, still fail
+    proxy_ok = census["proxy_ready"] >= 1 or (
+        census["proxy_total"] == 0 and not any("proxy" in d for d in census["deploys"])
+    )
+    if hub_ok and proxy_ok and not census["pending"]:
+        return Probe(
+            True,
+            f"jupyterhub OK — {census['summary']} (no PVC — resilient)",
+        )
+
+    # Structured failure: prefer scheduling diagnosis over bare ready counts
+    if census["pending"] and not census["node_schedulable"]:
+        return Probe(
+            False,
+            f"jupyterhub hub/proxy unscheduled — node not schedulable; "
+            f"do NOT redeploy until clear. census: {census['summary']}",
+        )
+    if census["pending"] and census["node_schedulable"]:
+        return Probe(
+            False,
+            f"jupyterhub hub/proxy Pending but node schedulable — recycle pods. "
+            f"census: {census['summary']}",
+        )
+    if census["hub_total"] == 0 and not census["deploys"]:
+        return Probe(False, f"jupyterhub hub absent (no pods/deploys). census: {census['summary']}")
+    return Probe(
+        False,
+        f"jupyterhub not Ready — census: {census['summary']}",
+    )
 
 
 def _rem_jupyterhub(ctx: Ctx) -> Fix:
-    """SC-less hub path: remove ALL jupyterhub PVCs + hub-db PVs (old sqlite-pvc /
-    local-path vestiges), then redeploy chart (sqlite-memory, storage none).
+    """Resolve hub/proxy via census-driven procedure (not always zarf deploy).
 
-    Field: when the jupyterhub namespace is entirely absent (never installed, or
-    wiped), a plain ``zarf package deploy --components=jupyterhub`` is the
-    unblock — same as the successful manual remediation on-prem. PVC cleanup is
-    a no-op if the ns does not exist; deploy creates ns + hub + proxy.
+    Order (cheapest first):
+      1. Namespace/deploy missing → zarf package deploy jupyterhub,sample-notebooks
+      2. PVC vestiges → delete PVC/PV, recycle pods
+      3. Pending + node NOT schedulable (DiskPressure/taint/cordon) → MANUAL
+         (refuse expensive redeploy that worsens imagefs)
+      4. Pending + node schedulable → recycle Pending hub/proxy pods only
+      5. Still not Ready / missing deploy → zarf package deploy
+      6. Oversubscription hints in FailedScheduling → worker capacity rem hint
     """
     actions: List[str] = []
-    ns_obj = ctx.get("namespace", "jupyterhub")
-    if not ns_obj:
-        actions.append("jupyterhub namespace absent — deploy will create it")
-    for pvc in list(ctx.items("pvc", ns="jupyterhub")):
+    ns_obj = ctx.get("namespace", _JH_NS)
+
+    # --- 1/2 PVC vestiges (always safe) ------------------------------------
+    for pvc in list(ctx.items("pvc", ns=_JH_NS)):
         name = pvc.get("metadata", {}).get("name", "")
         phase = pvc.get("status", {}).get("phase")
         sc = (pvc.get("spec", {}) or {}).get("storageClassName")
         sc = "" if sc is None else sc
-        if name and _force_delete_pvc(ctx, "jupyterhub", name):
+        if name and _force_delete_pvc(ctx, _JH_NS, name):
             actions.append(f"deleted jupyterhub PVC {name} (phase={phase} sc={sc!r})")
     for pv in list(ctx.items("pv")):
         pname = (pv.get("metadata") or {}).get("name", "")
         claim = (pv.get("spec") or {}).get("claimRef") or {}
-        if claim.get("namespace") == "jupyterhub" or "hub-db" in pname:
+        if claim.get("namespace") == _JH_NS or "hub-db" in pname:
             phase = pv.get("status", {}).get("phase")
             if ctx.k(["delete", "pv", pname, "--ignore-not-found"]).returncode == 0:
                 actions.append(f"deleted hub-related PV {pname} (phase={phase})")
-    # Hub Deployment may still reference old volume — recycle hub pods after PVC gone
-    if ns_obj:
-        ctx.k(["delete", "pod", "-n", "jupyterhub", "-l", "component=hub",
-               "--force", "--grace-period=0", "--wait=false", "--ignore-not-found"])
-    # Deploy hub + notebooks together (ns created by jupyterhub chart; ConfigMap
-    # rides sample-notebooks). Field unblock was exactly:
-    #   zarf package deploy --components=jupyterhub
+
+    census = _jupyterhub_workload_census(ctx)
+
+    # --- 3 Pending + node blocked → resolve DiskPressure via FSM when df OK
+    if census["pending"] and not census["node_schedulable"]:
+        if census.get("disk_pressure") or _disk_pressure_issues(ctx):
+            cleared = _platform.rem_resolve_disk_pressure(ctx)
+            actions.append(cleared.detail)
+            if cleared.changed:
+                census = _jupyterhub_workload_census(ctx)
+            elif _disk_pressure_issues(ctx):
+                detail = cleared.detail
+                if actions:
+                    detail += f"  [unwound: {'; '.join(actions)}]"
+                return Fix(False, detail)
+        if not census["node_schedulable"] and not _node_schedulability_census(ctx)["schedulable"]:
+            detail = (
+                f"hub/proxy Pending while node not schedulable — "
+                f"{census['summary']}. Refusing zarf redeploy."
+            )
+            if actions:
+                detail += f"  [unwound: {'; '.join(actions)}]"
+            return Fix(bool(actions), _manual.join_detail(
+                detail, _manual.hint_for("T5.jupyterhub")))
+        # Pressure cleared — fall through to recycle path
+
+    # --- 4 Pending + schedulable → recycle only ----------------------------
+    if census["pending"] and census["node_schedulable"] and (
+            census["deploys"] or census["hub_total"] or census["proxy_total"]):
+        recycled = _recycle_jupyterhub_pending(ctx)
+        actions.extend(recycled)
+        # brief re-census
+        again = _jupyterhub_workload_census(ctx)
+        if again["hub_ready"] >= 1 and (
+                again["proxy_ready"] >= 1 or again["proxy_total"] == 0):
+            return Fix(True, f"recycled hub/proxy after schedule restored — "
+                             f"{again['summary']}"
+                             + (f"  [unwound: {'; '.join(actions)}]" if actions else ""))
+        # If still pending but schedulable, one more recycle of all hub/proxy
+        # (covers controllers that recreate with stuck state)
+        if recycled:
+            for sel in _JH_SELECTORS:
+                ctx.k(["delete", "pod", "-n", _JH_NS, "-l", sel,
+                       "--force", "--grace-period=0", "--wait=false",
+                       "--ignore-not-found"])
+            actions.append("force-recycled all hub/proxy pods for reschedule")
+            again = _jupyterhub_workload_census(ctx)
+            if again["hub_ready"] >= 1:
+                return Fix(True, f"rescheduled jupyterhub — {again['summary']}  "
+                                 f"[unwound: {'; '.join(actions)}]")
+        # Deploy exists — wait next reconcile pass rather than immediate zarf redeploy
+        if census["deploys"] or again.get("deploys"):
+            detail = (
+                f"recycled pods; hub still not Ready — census: {again['summary']} "
+                f"(wait next pass / check resources)"
+            )
+            if actions:
+                detail += f"  [unwound: {'; '.join(actions)}]"
+            return Fix(bool(actions), detail)
+
+    # --- 5 Missing ns / deploys / pods → package deploy --------------------
+    if not ns_obj or (census["hub_total"] == 0 and not census["deploys"]):
+        if not ns_obj:
+            actions.append("jupyterhub namespace absent — deploy will create it")
+        fix = _zarf_deploy_components(ctx, "jupyterhub,sample-notebooks")
+        if actions:
+            return Fix(fix.changed or bool(actions),
+                       f"{fix.detail}  [unwound: {'; '.join(actions)}]")
+        return fix
+
+    # Deploy exists but never Ready and not a pure Pending-sched case → redeploy
+    # (ImagePull, CrashLoop, missing replica). Still refuse under disk pressure.
+    if _disk_pressure_issues(ctx):
+        return Fix(bool(actions), _manual.join_detail(
+            f"MANUAL: jupyterhub deploys present but not Ready under disk pressure — "
+            f"{census['summary']}",
+            _manual.hint_for("T5.jupyterhub"),
+        ))
+
+    # Worker oversubscription often coexists — try capacity rem first (cheap)
+    hints = " ".join(census.get("sched_hints") or []).lower()
+    if any(x in hints for x in ("insufficient", "memory", "cpu", "too many pods")):
+        cap = _rem_workers_capacity(ctx)
+        if cap.changed:
+            actions.append(cap.detail)
+            actions.extend(_recycle_jupyterhub_pending(ctx))
+            again = _jupyterhub_workload_census(ctx)
+            if again["hub_ready"] >= 1:
+                return Fix(True, f"worker cap + recycle → hub Ready — {again['summary']}  "
+                                 f"[unwound: {'; '.join(actions)}]")
+
     fix = _zarf_deploy_components(ctx, "jupyterhub,sample-notebooks")
     if actions:
         return Fix(fix.changed or bool(actions),
@@ -1924,14 +4102,81 @@ def _rem_jupyterhub(ctx: Ctx) -> Fix:
     return fix
 
 
+# Must match zarf/scripts/embed-notebooks.py INCLUDE_NOTEBOOKS + sidecars.
+# Presence-only detect masked stale CMs (pre-HDF5) so T5.sample-notebooks was
+# green while JupyterLab only showed OTEL/Dask notebooks (converge-27).
+# JupyterHub singleuser seeds /root/*.ipynb + generate_hdf5.py + cluster_env.py
+# from this ConfigMap at server start (jupyterhub-values.yaml cmd).
+_SAMPLE_NOTEBOOK_KEYS = (
+    "OTEL_Data_Generator.ipynb",
+    "Dask_S3_Validation.ipynb",
+    "Dask_S3_Workers_OneCell.ipynb",
+    "HDF5_CPHY_Acquisition_Generator.ipynb",
+    "HDF5_Iceberg_Metadata_Provider.ipynb",
+)
+# HDF5 notebooks need these on the CM mount (copied to /root at singleuser start).
+_SAMPLE_NOTEBOOK_SIDECARS = (
+    "generate_hdf5.py",
+    "cluster_env.py",
+)
+
+
+def _sample_notebooks_keys(ctx: Ctx) -> List[str]:
+    cm = ctx.get("configmap", "sample-notebooks", ns="jupyterhub")
+    if not cm:
+        return []
+    data = cm.get("data") or {}
+    return sorted(data.keys())
+
+
 def _det_sample_notebooks(ctx: Ctx) -> Probe:
-    ok = ctx.exists("configmap", "sample-notebooks", ns="jupyterhub")
-    return Probe(ok, "sample-notebooks ConfigMap present" if ok
-                 else "sample-notebooks ConfigMap absent")
+    if not ctx.exists("configmap", "sample-notebooks", ns="jupyterhub"):
+        return Probe(False, "sample-notebooks ConfigMap absent")
+    keys = set(_sample_notebooks_keys(ctx))
+    nb_keys = {k for k in keys if k.endswith(".ipynb")}
+    missing_nb = [k for k in _SAMPLE_NOTEBOOK_KEYS if k not in nb_keys]
+    missing_side = [k for k in _SAMPLE_NOTEBOOK_SIDECARS if k not in keys]
+    if missing_nb or missing_side:
+        parts = []
+        if missing_nb:
+            parts.append(f"notebooks {missing_nb}")
+        if missing_side:
+            parts.append(f"sidecars {missing_side} (HDF5 needs generate_hdf5.py + cluster_env.py)")
+        return Probe(
+            False,
+            f"sample-notebooks ConfigMap missing {' and '.join(parts)} "
+            f"(have {sorted(keys)}) — re-embed + package create, then "
+            f"`zarf package deploy --components=sample-notebooks` (or full converge); "
+            f"stop/start Jupyter singleuser so /root seeds refresh",
+        )
+    hdf5 = [k for k in _SAMPLE_NOTEBOOK_KEYS if k.startswith("HDF5_")]
+    return Probe(
+        True,
+        f"sample-notebooks ConfigMap OK ({len(nb_keys)} notebooks incl. "
+        f"{len(hdf5)} HDF5 + sidecars) — singleuser start copies to /root",
+    )
 
 
 def _rem_sample_notebooks(ctx: Ctx) -> Fix:
-    return _zarf_deploy_components(ctx, "sample-notebooks")
+    """Redeploy CM; recycle hub user pods so mounts/startup re-seed home copies."""
+    fix = _zarf_deploy_components(ctx, "sample-notebooks")
+    actions = [fix.detail]
+    # Singleuser pods mount the CM; without restart they keep the old volume
+    # snapshot and /root/*.ipynb from the previous startup copy.
+    r = ctx.k([
+        "delete", "pod", "-n", "jupyterhub",
+        "-l", "component=singleuser-server",
+        "--ignore-not-found", "--wait=false",
+    ])
+    if r.returncode == 0:
+        actions.append(
+            "deleted jupyterhub singleuser pods "
+            "(re-login / Start My Server to re-seed /root incl. HDF5 + generate_hdf5.py)"
+        )
+    # Re-detect content
+    if _det_sample_notebooks(ctx).ok:
+        return Fix(True, " | ".join(actions))
+    return Fix(fix.changed, " | ".join(actions) + f"; still: {_det_sample_notebooks(ctx).detail}")
 
 
 def _det_ingress(ctx: Ctx) -> Probe:
@@ -2009,8 +4254,10 @@ def build_catalog(dynamic_provisioning: bool = False,
                   "Kubelet image-GC policy raised (protects Layer-A images on disk pressure)",
                   Layer.B, _platform.det_kubelet_gc_policy, _platform.rem_kubelet_gc_policy,
                   depends_on=("T0.api",), manual_hint=H("T0.kubelet-gc")),
-        Invariant("T0.no-disk-pressure", "T0", "No disk-pressure taint (lenient eviction persisted)",
-                  Layer.A, _det_no_disk_pressure, depends_on=("T0.api",),
+        Invariant("T0.no-disk-pressure", "T0",
+                  "No DiskPressure (df vs configured hard GiB; clear taint + wait when free OK)",
+                  Layer.B, _det_no_disk_pressure, _rem_no_disk_pressure,
+                  depends_on=("T0.api", "T0.kubelet-gc"),
                   manual_hint=H("T0.no-disk-pressure")),
         # Layer-A tools: binary + init package must be on the node (rc=127 / air-gap init).
         Invariant("T0.layer-a-zarf-tools", "T0",
@@ -2026,6 +4273,10 @@ def build_catalog(dynamic_provisioning: bool = False,
     # T0.5 — storage. Resilient (default): the registry binds a claimRef hostPath PV,
     # no StorageClass. Dynamic (opt-in): the node-preloaded local-path-provisioner
     # supplies a default StorageClass and the registry PVC binds through it.
+    # Disk pressure gates long zarf deploys (T1+). T0.kubelet-gc stays independent so
+    # it can still raise GC thresholds while the operator frees space.
+    _disk = ("T0.no-disk-pressure",)
+
     if dynamic_provisioning:
         inv += [
             Invariant("T0.layer-a-images", "T0", "Bootstrap images present (CLOSURE)", Layer.A,
@@ -2033,24 +4284,25 @@ def build_catalog(dynamic_provisioning: bool = False,
                       manual_hint=H("T0.layer-a-images")),
             Invariant("T0.5.sc-default", "T0.5", "Default StorageClass exists", Layer.B,
                       _det_sc_default, _rem_sc_default,
-                      depends_on=("T0.node-ready", "T0.layer-a-images"),
+                      depends_on=("T0.node-ready", "T0.layer-a-images") + _disk,
                       manual_hint=H("T0.5.sc-default")),
             Invariant("T0.5.provisioner", "T0.5", "local-path-provisioner Running", Layer.B,
                       _det_provisioner, _rem_provisioner, depends_on=("T0.5.sc-default",),
                       manual_hint=H("T0.5.provisioner")),
         ]
-        registry_dep = ("T0.5.sc-default",)
+        registry_dep = ("T0.5.sc-default",) + _disk
     elif registry_pvc_enabled:
         inv += [
             Invariant("T0.5.registry-pv", "T0.5",
                       "Registry storage prebound (claimRef hostPath PV — no default SC needed)",
-                      Layer.B, _det_registry_pv, _rem_registry_pv, depends_on=("T0.node-ready",),
+                      Layer.B, _det_registry_pv, _rem_registry_pv,
+                      depends_on=("T0.node-ready",) + _disk,
                       manual_hint=H("T0.5.registry-pv")),
         ]
-        registry_dep = ("T0.5.registry-pv",)
+        registry_dep = ("T0.5.registry-pv",) + _disk
     else:
         # --no-registry-pvc: the registry runs on emptyDir — nothing to prebind.
-        registry_dep = ("T0.node-ready",)
+        registry_dep = ("T0.node-ready",) + _disk
 
     inv += [
         Invariant("T1.registry-running", "T1", "Zarf internal registry initialized + Running",
@@ -2059,31 +4311,37 @@ def build_catalog(dynamic_provisioning: bool = False,
 
         Invariant("T2.images-pushed", "T2", "App images pushed to internal registry",
                   Layer.B, _det_images_pushed, _rem_images_pushed, cost=Cost.EXPENSIVE,
-                  depends_on=("T1.registry-running",), manual_hint=H("T2.images-pushed")),
+                  depends_on=("T1.registry-running",) + _disk,
+                  manual_hint=H("T2.images-pushed")),
 
         Invariant("T3.dask-operator", "T3", "Dask operator + CRDs", Layer.B,
-                  _det_operator, _rem_operator, depends_on=("T2.images-pushed",),
+                  _det_operator, _rem_operator, cost=Cost.EXPENSIVE,
+                  depends_on=("T2.images-pushed",) + _disk,
                   manual_hint=H("T3.dask-operator")),
 
         Invariant("T4.scheduler", "T4", "Dask scheduler Ready", Layer.B,
-                  _det_scheduler, _rem_scheduler, depends_on=("T3.dask-operator",),
+                  _det_scheduler, _rem_scheduler, cost=Cost.EXPENSIVE,
+                  depends_on=("T3.dask-operator",) + _disk,
                   manual_hint=H("T4.scheduler")),
-        Invariant("T4.workers-capacity", "T4", "Workers fit schedulable capacity (no oversubscription)",
+        Invariant("T4.workers-capacity", "T4",
+                  "Workers sized (replicas/nthreads/cpu/memory) and fit capacity",
                   Layer.B, _det_workers_capacity, _rem_workers_capacity,
                   depends_on=("T4.scheduler",), manual_hint=H("T4.workers-capacity")),
 
         Invariant("T5.otel-navigator", "T5", "otel-navigator Ready (2/2, fits memory)", Layer.B,
                   _det_otel_navigator, _rem_otel_navigator,
-                  depends_on=("T4.scheduler", "T4.workers-capacity"),
+                  depends_on=("T4.scheduler", "T4.workers-capacity") + _disk,
                   manual_hint=H("T5.otel-navigator")),
         Invariant("T5.navigator-engine", "T5", "navigator-engine Ready", Layer.B,
-                  _det_engine, _rem_engine, depends_on=("T4.scheduler",),
+                  _det_engine, _rem_engine, depends_on=("T4.scheduler",) + _disk,
                   manual_hint=H("T5.navigator-engine")),
         Invariant("T5.jupyterhub", "T5", "JupyterHub hub Ready", Layer.B,
-                  _det_jupyterhub, _rem_jupyterhub, depends_on=("T2.images-pushed",),
+                  _det_jupyterhub, _rem_jupyterhub, cost=Cost.EXPENSIVE,
+                  depends_on=("T2.images-pushed",) + _disk,
                   manual_hint=H("T5.jupyterhub")),
         Invariant("T5.sample-notebooks", "T5", "Sample-notebooks ConfigMap present", Layer.B,
-                  _det_sample_notebooks, _rem_sample_notebooks, depends_on=("T2.images-pushed",),
+                  _det_sample_notebooks, _rem_sample_notebooks, cost=Cost.EXPENSIVE,
+                  depends_on=("T2.images-pushed",) + _disk,
                   manual_hint=H("T5.sample-notebooks")),
         # Data path: Ready pods ≠ app can load spans. Layer-B detect-only — seed data
         # / fix creds is operator action (script: zarf/scripts/verify-s3-datapath.sh).

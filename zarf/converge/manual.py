@@ -300,6 +300,8 @@ HINTS = {
     "T0.no-disk-pressure": block(
         [
             "kc get nodes -o custom-columns=NAME:.metadata.name,TAINTS:.spec.taints",
+            "kc get nodes -o jsonpath='{range .items[*]}{.metadata.name}{\" DiskPressure=\"}"
+            "{range .status.conditions[?(@.type==\"DiskPressure\")]}{.status}{\" \"}{.message}{end}{\"\\n\"}{end}'",
             "df -h / /var/lib/rancher /var/tmp; du -sh /var/log /var/tmp/* 2>/dev/null | sort -h | tail",
         ],
         [
@@ -307,9 +309,16 @@ HINTS = {
             "journalctl --vacuum-size=200M",
             "kc get pods -A --field-selector=status.phase=Failed -o name | xargs -r -n1 kc delete",
             "# optional: remove a *redundant* package tarball copy only",
-            "# taint clears once free space is above eviction threshold; also apply T0.kubelet-gc",
+            "# Wait until condition DiskPressure=False (not only taint removed); then:",
+            "#   NODE=$(kc get nodes -o jsonpath='{.items[0].metadata.name}')",
+            "#   kc taint nodes $NODE node.kubernetes.io/disk-pressure:NoSchedule- 2>/dev/null || true",
+            "#   kc uncordon $NODE 2>/dev/null || true",
+            "# Also ensure T0.kubelet-gc absolute free-space thresholds on large disks",
         ],
-        note="Layer-A: free disk SAFELY — never prune container images",
+        note="DiskPressure: MANUAL only if df < configured hard GiB (default 5Gi from "
+             "kubelet eviction-hard). If df >= hard, FSM clears taint and waits "
+             "configured soft-grace + 10s only "
+             "for condition False, then continues.",
     ),
     "T0.layer-a-zarf-tools": block(
         [
@@ -422,26 +431,82 @@ HINTS = {
         "dask-operator",
         note="Dask operator / CRDs absent or not Ready",
     ),
-    "T4.scheduler": zarf_deploy_recipe(
-        "dask-cluster",
-        needs_s3=True,
-        note="Dask scheduler not Ready — redeploy dask-cluster (creates CR children)",
+    "T4.scheduler": block(
+        [
+            "kc -n dask get pods,daskcluster -o wide",
+            "kc -n dask describe pod -l dask.org/component=scheduler 2>/dev/null | sed -n '/Events:/,$p' | tail -30",
+            "kc get nodes -o jsonpath='{range .items[*]}{.metadata.name}{\" DiskPressure=\"}"
+            "{range .status.conditions[?(@.type==\"DiskPressure\")]}{.status}{end}{\"\\n\"}{end}'",
+            "kc -n zarf get pods -o wide; zarf tools registry catalog 2>/dev/null | head -20",
+            "kc -n dask-operator get pods -o wide",
+        ],
+        [
+            "# ── A) DiskPressure / taint — NO redeploy (see T0.no-disk-pressure) ──",
+            "# Wait DiskPressure=False; clear taint; uncordon",
+            "# ── B) Node schedulable + scheduler Pending/CrashLoop — recycle ──",
+            "kc -n dask delete pod -l dask.org/component=scheduler "
+            "--force --grace-period=0 --wait=false 2>/dev/null || true",
+            "# ── C) ImagePull — push app image then recycle ──",
+            'zarf package deploy "$PKG" --confirm --components=cybersec-images --retries 5',
+            "kc -n dask delete pod -l dask.org/component=scheduler --force --grace-period=0 2>/dev/null || true",
+            "# ── D) CR / cluster missing — package path (after-action wait may be 900s) ──",
+            'zarf package deploy "$PKG" --confirm --components=dask-cluster --retries 5 "${SETV[@]}"',
+            "# If only after-action wait timed out but CR exists: check pods; recycle; skip full redeploy",
+        ],
+        note="scheduler: census node+registry+pod first. Recycle when schedulable; "
+             "zarf dask-cluster only if CR/pods absent. Wait timeout ≠ missing objects.",
+    ),
+    "T0.package-uniqueness": block(
+        [
+            "ls -lt ./zarf-package-cybersec-dask-amd64-*.tar.zst "
+            "/var/tmp/zarf-package-cybersec-dask-amd64-*.tar.zst 2>/dev/null",
+            "# package path is always operator-chosen — never assumed by the script",
+        ],
+        [
+            "# Pin the kit explicitly (path you control):",
+            'sudo ./converge-node.sh apply /path/you/chose/zarf-package-cybersec-dask-amd64-1.6.6.tar.zst',
+            "# Or place the package next to converge-node.sh / in CWD and omit argv2",
+            "# Optional: archive extras (engine never deletes Layer-A packages)",
+        ],
+        note="Multiple packages only matter without --package (discovery). "
+             "Explicit argv2/--package pins the kit; siblings are archive OK.",
     ),
     "T4.workers-capacity": block(
         [
             "kc get nodes -o custom-columns=NAME:.metadata.name,CPU:.status.allocatable.cpu,"
             "MEM:.status.allocatable.memory,SCHED:.spec.unschedulable",
-            "kc -n dask get deploy,pods -o wide",
-            "kc -n dask get pods --field-selector=status.phase=Pending -o wide",
+            "kc -n dask get daskcluster cybersec-dask -o jsonpath='"
+            "{.spec.worker.replicas}{\" replicas\\n\"}"
+            "{.spec.worker.spec.containers[0].args}{\"\\n\"}"
+            "{.spec.worker.spec.containers[0].resources}{\"\\n\"}'",
+            "kc -n dask get deploy,pods -l dask.org/component=worker -o wide",
+            "kc -n dask get pods -l dask.org/component=worker "
+            "--field-selector=status.phase=Pending -o wide",
         ],
         [
-            "# Cap workers to schedulable_nodes-1 (min 1); engine: _rem_workers_capacity",
-            "kc -n dask get daskcluster cybersec-dask -o yaml | head -80",
-            "# set DASK_WORKER_REPLICAS then:",
-            'zarf package deploy "$PKG" --confirm --components=dask-cluster --retries 10 "${SETV[@]}"',
-            "# or scale/reap excess worker Deployments after CR update",
+            "# Engine 0.5.0: surgical CR patch + worker bounce (no zarf re-push).",
+            "# Canonical: DASK_WORKER_REPLICAS / NTHREADS / CPU / MEMORY",
+            "# Aliases:   DASK_WORKER_MEM_LIMIT→MEMORY, MEM_REQUEST→requests.memory",
+            "export DASK_WORKER_REPLICAS=${DASK_WORKER_REPLICAS:-4}",
+            "export DASK_WORKER_NTHREADS=${DASK_WORKER_NTHREADS:-2}",
+            "export DASK_WORKER_CPU=${DASK_WORKER_CPU:-2}",
+            "export DASK_WORKER_MEMORY=${DASK_WORKER_MEMORY:-6Gi}",
+            "# Cap by RAM: floor((total_alloc_Gi − 8) / worker_Gi); Pending shrinks further",
+            "kc -n dask patch daskcluster cybersec-dask --type merge -p \"{\\\"spec\\\":{"
+            "\\\"worker\\\":{\\\"replicas\\\":${DASK_WORKER_REPLICAS}}}}\"",
+            "# Full sizing (replicas + args + limits) — prefer converge apply:",
+            "#   DASK_WORKER_*=… python3 -m converge --apply …",
+            "# Manual template edit: get CR, set --nthreads / --memory-limit / limits, apply;",
+            "# then bounce (operator often skips pod roll on template-only changes):",
+            "kc -n dask delete pod -l dask.org/component=worker "
+            "--force --grace-period=0 --wait=false",
+            "# Reap excess worker Deployments (Pending / least-ready first):",
+            "kc -n dask get deploy -l dask.org/component=worker "
+            "--sort-by=.status.readyReplicas -o name | "
+            "head -n -${DASK_WORKER_REPLICAS} | xargs -r -n1 kc -n dask delete --wait=false",
         ],
-        note="Workers Pending (oversubscribed) — strands panel memory",
+        note="Workers Pending or sizing drift (replicas/nthreads/cpu/memory) — "
+             "surgical CR patch; strands panel if oversubscribed",
     ),
     "T5.otel-navigator": block(
         _discover_for_components("cybersec-images,panel-viz") + [
@@ -522,14 +587,45 @@ HINTS = {
         note="S3 datapath: ConfigMap bucket must be reachable from the app and "
              "_active_dataset.json + span parquet must be readable (spans already in place).",
     ),
-    "T5.jupyterhub": zarf_deploy_recipe(
-        "jupyterhub,sample-notebooks",
-        note="JupyterHub missing/broken — same as field unblock: "
-        "zarf package deploy --components=jupyterhub (engine co-deploys notebooks)",
+    "T5.jupyterhub": block(
+        [
+            "kc get ns jupyterhub 2>/dev/null; kc -n jupyterhub get pods,deploy,svc,pvc -o wide",
+            "kc -n jupyterhub get pods -l 'component in (hub,proxy)' "
+            "--field-selector=status.phase=Pending -o wide 2>/dev/null",
+            "kc -n jupyterhub describe pod -l component=hub 2>/dev/null | sed -n '/Events:/,$p' | tail -25",
+            "kc get nodes -o jsonpath='{range .items[*]}{.metadata.name}{\" Ready=\"}"
+            "{range .status.conditions[?(@.type==\"Ready\")]}{.status}{end}"
+            "{\" DiskPressure=\"}{range .status.conditions[?(@.type==\"DiskPressure\")]}{.status}{end}"
+            "{\"\\n\"}{end}'",
+            "kc -n dask get pods -l dask.org/component=worker -o wide 2>/dev/null | head",
+            "kc -n jupyterhub get cm sample-notebooks 2>/dev/null | head",
+        ],
+        [
+            "# ── A) Node not schedulable (DiskPressure / taint / cordon) — NO zarf redeploy ──",
+            "# Wait until DiskPressure=False; then clear taint + uncordon (see T0.no-disk-pressure)",
+            "# ── B) Node schedulable + hub/proxy Pending — recycle only (engine does this) ──",
+            "kc -n jupyterhub delete pod -l component=hub --field-selector=status.phase=Pending "
+            "--force --grace-period=0 --wait=false 2>/dev/null || true",
+            "kc -n jupyterhub delete pod -l component=proxy --field-selector=status.phase=Pending "
+            "--force --grace-period=0 --wait=false 2>/dev/null || true",
+            "kc -n jupyterhub get pods -o wide",
+            "# ── C) Insufficient CPU/memory — cap Dask workers, then recycle hub/proxy ──",
+            "TARGET=$(( $(kc get nodes --no-headers 2>/dev/null | wc -l) - 1 )); "
+            "[ \"${TARGET:-1}\" -lt 1 ] && TARGET=1",
+            "kc -n dask patch daskcluster cybersec-dask --type merge "
+            "-p \"{\\\"spec\\\":{\\\"worker\\\":{\\\"replicas\\\":$TARGET}}}\" 2>/dev/null || true",
+            "# ── D) Namespace/deploy missing or ImagePull — package path ──",
+            'PKG="${PKG:-$PKG}"; test -f "$PKG" || { echo "package missing"; exit 1; }',
+            'zarf package deploy "$PKG" --confirm --components=jupyterhub,sample-notebooks --retries 10',
+        ],
+        note="jupyterhub: census first (Pending vs DiskPressure vs missing deploy). "
+             "Recycle pods when node is schedulable; zarf deploy only if chart/ns absent.",
     ),
     "T5.sample-notebooks": zarf_deploy_recipe(
         "sample-notebooks",
-        note="sample-notebooks ConfigMap absent",
+        note="sample-notebooks CM missing required keys (HDF5_*.ipynb + "
+             "generate_hdf5.py + cluster_env.py) or absent — re-embed, package, "
+             "deploy sample-notebooks; Stop/Start Jupyter so /root seeds refresh",
     ),
     "T6.ingress": zarf_deploy_recipe(
         "ingress",

@@ -1,6 +1,6 @@
 # Testing & Verification
 
-End-to-end testing procedures for the Cybersec Toolkit.
+End-to-end testing procedures for the Cyberphy Toolkit.
 
 ## Quick Verification
 

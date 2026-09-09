@@ -1,18 +1,80 @@
 { pkgs, lib, config, inputs, ... }:
 
+let
+  # ---------------------------------------------------------------------------
+  # RustFS (local S3) — same pattern as ~/local/src/wxs/vigil
+  # Overlay builds rustfs from github:rustfs/rustfs (not nixpkgs minio, insecure).
+  # Service module is vendored at modules/rustfs.nix (pinned devenv modules lack it).
+  # ---------------------------------------------------------------------------
+
+  # mc wrapper: configures a "local" alias from RUSTFS_* env (port-aware).
+  # When services.rustfs.bind is 0.0.0.0, RUSTFS_ADDRESS is "0.0.0.0:PORT" —
+  # correct for the server, but clients should dial 127.0.0.1 (same as vigil).
+  mc = pkgs.writeShellScriptBin "mc" ''
+    set -euo pipefail
+    CLIENT_DIR="''${RUSTFS_CLIENT_CONFIG_DIR:-$DEVENV_STATE/rustfs/mc}"
+    mkdir -p "$CLIENT_DIR"
+    ADDRESS="''${RUSTFS_ADDRESS:-127.0.0.1:9010}"
+    # Rewrite wildcard bind → loopback for the S3 client URL
+    case "$ADDRESS" in
+      0.0.0.0:*) ADDRESS="127.0.0.1:''${ADDRESS#0.0.0.0:}" ;;
+      [::]:*)    ADDRESS="[::1]:''${ADDRESS#\[::\]:}" ;;
+      *:*)       ;;
+    esac
+    ACCESS="''${RUSTFS_ACCESS_KEY:-admin}"
+    SECRET="''${RUSTFS_SECRET_KEY:-admin}"
+    cat > "$CLIENT_DIR/config.json" <<EOF
+    {
+      "version": "10",
+      "aliases": {
+        "local": {
+          "url": "http://''${ADDRESS}",
+          "accessKey": "''${ACCESS}",
+          "secretKey": "''${SECRET}",
+          "api": "S3v4",
+          "path": "auto"
+        }
+      }
+    }
+    EOF
+    chmod 600 "$CLIENT_DIR/config.json" 2>/dev/null || true
+    exec ${pkgs.minio-client}/bin/mc --config-dir "$CLIENT_DIR" "$@"
+  '';
+
+  # RUSTFS_DATA_DIR from dotenv/.env via getEnv (not config.env — avoids
+  # infinite recursion when extraEnvironment merges into config.env).
+  # Default: /raid/build/cyberphy/data/ (RAID, same pattern as vigil → /raid/build/vigil/data/).
+  rustfsDataDir =
+    let v = builtins.getEnv "RUSTFS_DATA_DIR";
+    in if v != "" then v else "/raid/build/cyberphy/data/";
+
+  # Local RustFS root credentials (MinIO is gone — simple lab defaults).
+  localS3AccessKey = "admin";
+  localS3SecretKey = "admin";
+  # Project-standard ports (not rustfs defaults 9000/9001) — k8s + zarf assume 9010.
+  localS3ApiPort = 9010;
+  localS3ConsolePort = 9011;
+
+  rustfsBuckets = [ "cyberphy" "cyberphy-hx" ];
+in
 {
   dotenv.enable = true;
 
-  # MinIO data directory - uses DEVENV_STATE by default
-  # Override in .cybersec/config.toml or set MINIO_DATA_DIR env var
-  # env.MINIO_DATA_DIR = lib.mkForce "/opt/minio/cybersec";  # Example override
+  # Credentials — MINIO_* retained for Python paths that prefer MINIO_* when
+  # S3_ENDPOINT is set (local object store vs real AWS profile).
+  env.MINIO_ACCESS_KEY = localS3AccessKey;
+  env.MINIO_SECRET_KEY = localS3SecretKey;
+  env.S3_ENDPOINT = "http://localhost:${toString localS3ApiPort}";
+  env.RUSTFS_ACCESS_KEY = localS3AccessKey;
+  env.RUSTFS_SECRET_KEY = localS3SecretKey;
+  env.RUSTFS_CLIENT_CONFIG_DIR = config.env.DEVENV_STATE + "/rustfs/mc";
+  # Shell-visible data root (override anytime with RUSTFS_DATA_DIR in the environment).
+  env.RUSTFS_DATA_DIR = rustfsDataDir;
 
-  # MinIO credentials - separate from AWS to avoid conflicts
-  # Python code checks MINIO_* first when S3_ENDPOINT is set (local MinIO)
-  # AWS CLI uses ~/.aws/credentials (default profile) for real AWS operations
-  env.MINIO_ACCESS_KEY = "minioadmin";
-  env.MINIO_SECRET_KEY = "minioadmin";
-  env.S3_ENDPOINT = "http://localhost:9010";
+  # Polaris catalog defaults (polaris-init / setup_polaris_catalog.sh)
+  env.POLARIS_CATALOG_NAME = "cyberphy";
+  env.POLARIS_WAREHOUSE = "s3://cyberphy/iceberg/warehouse";
+  env.S3_BUCKET = "cyberphy";
 
   # Flink home - built from source in thirdparty/flink
   # FLINK_CONF_DIR is the runtime overlay (python.executable, etc.). Keep it out of
@@ -26,6 +88,18 @@
   # Default to empty string so dotenv can override from .env file
   env.OTEL_S3_BUCKET = "";  # Set by aws:env task or .env file
 
+  # RustFS via our overlay (official release binary WITH console UI).
+  # Do NOT use inputs.rustfs.packages.*.default alone — that flake build skips
+  # rustfs/static, so /rustfs/console/ 404s (no embedded frontend).
+  # See nix/rustfs.nix and https://github.com/rustfs/rustfs/issues/4919
+  overlays = [
+    (final: prev: {
+      rustfs = import ./nix/rustfs.nix {
+        pkgs = prev;
+        system = prev.stdenv.hostPlatform.system;
+      };
+    })
+  ];
 
   # https://devenv.sh/packages/
   packages = with pkgs; [
@@ -47,6 +121,7 @@
     k3d
     kubectl
     kubernetes-helm
+    mc  # wrapped "local" alias using RUSTFS_* env vars at runtime
     mdbook
     mdbook-d2
     mdbook-katex
@@ -60,11 +135,32 @@
     zlib  # Required for numpy C extensions
   ];
 
-  services.minio = {
+  # Single-node RustFS — full replacement for services.minio.
+  # See https://docs.rustfs.com/installation/linux/single-node-single-disk.html
+  #
+  # Port handling (devenv processes):
+  # - services.rustfs allocates ports.api / ports.console from the bases below
+  # - Prefer runtime RUSTFS_ADDRESS / RUSTFS_PORT over hardcoding in scripts
+  # - bind 0.0.0.0 so RKE2/k3d pods reach host S3 at <node-ip>:9010
+  services.rustfs = {
     enable = true;
-    buckets = ["cybersec" "cybersec-hx"];
-    listenAddress = "0.0.0.0:9010";
-    consoleAddress = "0.0.0.0:9011";
+    package = pkgs.rustfs; # from rustfs overlay input
+    bind = "0.0.0.0";
+    port = localS3ApiPort;
+    consolePort = localS3ConsolePort;
+    accessKey = localS3AccessKey;
+    secretKey = localS3SecretKey;
+    extraEnvironment = {
+      RUSTFS_DATA_DIR = rustfsDataDir;
+    };
+  };
+
+  # Pre-create bucket dirs under RUSTFS_DATA_DIR (on top of devenv:rustfs:setup).
+  tasks."devenv:rustfs:buckets" = {
+    exec = lib.concatStringsSep "\n" (
+      map (b: ''mkdir -p "${rustfsDataDir}/${b}"'') rustfsBuckets
+    );
+    before = [ "devenv:processes:rustfs" ];
   };
 
   services.postgres = {
@@ -111,10 +207,12 @@
     package = pkgs.python312;
     uv.enable = true;
     uv.sync.enable = true;
-    # PyFlink is now a core dependency (not an extra).
-    # The k8s extra (dask) is compatible with flink after patching thirdparty/flink.
+    # PyFlink is a core dependency (not an extra).
+    # Shell syncs notebook/Dask stack so `uv run` / Jupyter can use Holoviews without
+    # manual --extra. k8s (dask) is compatible with flink after thirdparty/flink patch.
+    # Omit allExtras so engine/benchmark stay opt-in (heavier / specialized).
     uv.sync.allExtras = false;
-    uv.sync.extras = ["dev"];
+    uv.sync.extras = [ "dev" "observability" "k8s" ];
     venv.enable = true;
   };
 
@@ -212,9 +310,16 @@ if needs_init:
       echo ""
     fi
 
-    # Kubernetes target detection (from KUBECONFIG only, no ENABLE_K8S fallback)
-    # Priority: 1) Explicit CYBERSEC_K8S_TARGET, 2) KUBECONFIG contents
-    if [ -z "''${CYBERSEC_K8S_TARGET:-}" ]; then
+    # Prefer a *working* kubeconfig (RKE2 first) over broken defaults
+    if [ -f "$PWD/scripts/lab_env.sh" ]; then
+      # shellcheck source=/dev/null
+      source "$PWD/scripts/lab_env.sh"
+      if resolve_kubeconfig; then
+        export KUBECONFIG
+      fi
+      detect_k8s_target >/dev/null
+      ensure_local_s3_env
+    elif [ -z "''${CYBERSEC_K8S_TARGET:-}" ]; then
       DETECTED_K8S_TARGET="none"
       if [ -n "''${KUBECONFIG:-}" ] && [ -f "$KUBECONFIG" ]; then
         if grep -qE "rancher|rke2" "$KUBECONFIG" 2>/dev/null; then
@@ -224,6 +329,7 @@ if needs_init:
         fi
       fi
       export CYBERSEC_K8S_TARGET="$DETECTED_K8S_TARGET"
+      export CYBERPHY_K8S_TARGET="$DETECTED_K8S_TARGET"
     fi
   '';
   
@@ -234,6 +340,13 @@ if needs_init:
   tasks = {
     "docs:build".exec = "mdbook build docs/current";
     "docs:open".exec = "mdbook build docs/current --open";
+
+    # Lab + RKE2 + Zarf NodePort status (shared resolver: scripts/lab_env.sh)
+    "lab:status".exec = ''
+      source scripts/lab_env.sh
+      resolve_kubeconfig || true
+      lab_status_report
+    '';
 
     # Clean rebuild of Flink lib/ (Iceberg connectors + Hadoop client)
     # Use after submodule updates, version changes, or classpath issues
@@ -356,17 +469,30 @@ print('Environment config written to build/environment.json')
     "polaris:init".exec = ''
       source scripts/polaris_bootstrap_helper.sh
       
-      log_info "Manually initializing Polaris catalog..."
+      log_info "Manually initializing Polaris catalog (cyberphy + RustFS)..."
+
+      export POLARIS_CATALOG_NAME="''${POLARIS_CATALOG_NAME:-cyberphy}"
+      export S3_ENDPOINT="''${S3_ENDPOINT:-http://localhost:9010}"
+      export S3_BUCKET="''${S3_BUCKET:-cyberphy}"
+      export S3_ACCESS_KEY="''${RUSTFS_ACCESS_KEY:-''${MINIO_ACCESS_KEY:-''${AWS_ACCESS_KEY_ID:-admin}}}"
+      export S3_SECRET_KEY="''${RUSTFS_SECRET_KEY:-''${MINIO_SECRET_KEY:-''${AWS_SECRET_ACCESS_KEY:-admin}}}"
+      export POLARIS_WAREHOUSE="''${POLARIS_WAREHOUSE:-s3://''${S3_BUCKET}/iceberg/warehouse}"
       
       # Check if Polaris is running
       if ! wait_for_polaris 1 0; then
         log_error "Polaris is not running. Start it with: devenv up"
         exit 1
       fi
+
+      # RustFS must be up for warehouse base location
+      if ! curl -sf --max-time 3 "$S3_ENDPOINT/health" >/dev/null 2>&1; then
+        log_error "RustFS/S3 not reachable at $S3_ENDPOINT (start devenv / rustfs process)"
+        exit 1
+      fi
       
       # Trigger catalog initialization with retry
       if trigger_catalog_init 3 ./setup_polaris_catalog.sh; then
-        log_success "Catalog initialized and verified successfully"
+        log_success "Catalog initialized and verified successfully ($POLARIS_CATALOG_NAME)"
       else
         log_error "Catalog initialization failed after retries"
         exit 1
@@ -390,11 +516,11 @@ print('Environment config written to build/environment.json')
         exit 1
       fi
       
-      # Check if catalog exists
-      if verify_catalog "cybersec"; then
-        echo "Polaris is properly configured"
+      # Check if catalog exists (cyberphy + RustFS warehouse)
+      if verify_catalog "cyberphy"; then
+        echo "Polaris is properly configured (catalog=cyberphy, S3=RustFS)"
       else
-        echo "Catalog 'cybersec' not found"
+        echo "Catalog 'cyberphy' not found"
         echo "   This should have been created automatically by the polaris-init process"
         echo "   To initialize manually, run: devenv tasks run polaris:init"
         exit 1
@@ -483,7 +609,7 @@ exit(asyncio.run(main()))
         echo "  - Release unused EIPs shown above"
         echo "  - Or request a quota increase from AWS"
         echo ""
-        echo "Run 'cybersec \"/aws preflight $REGION\"' for details."
+        echo "Run 'cyberphy \"/aws preflight $REGION\"' for details."
         exit 1
       fi
 
@@ -1059,7 +1185,7 @@ PY
 
     # Show developer identity and AWS configuration
     "aws:identity".exec = ''
-      uv run cybersec "/aws"
+      uv run cyberphy "/aws"
     '';
 
     # Show active AWS profile/region and validate credentials
@@ -1174,7 +1300,7 @@ PY
       echo "======================================"
 
       echo "Setting AWS region to us-east-1..."
-      uv run cybersec "/aws target us-east-1"
+      uv run cyberphy "/aws target us-east-1"
 
       echo ""
       echo "Developer identity:"
@@ -1194,9 +1320,9 @@ PY
     "aws:s3:verify".exec = ''
       BUCKET="''${1:-}"
       if [ -n "$BUCKET" ]; then
-        uv run cybersec "/aws s3:verify $BUCKET"
+        uv run cyberphy "/aws s3:verify $BUCKET"
       else
-        uv run cybersec "/aws s3:verify"
+        uv run cyberphy "/aws s3:verify"
       fi
     '';
 
@@ -1224,7 +1350,7 @@ PY
       [ -n "$APPLY" ] && CMD="$CMD --apply"
       [ -n "$SKIP_VERIFY" ] && CMD="$CMD --skip-verify"
 
-      uv run cybersec "$CMD"
+      uv run cyberphy "$CMD"
     '';
 
     # =========================================================================
@@ -1235,7 +1361,7 @@ PY
 
     # Show current AWS target configuration
     "aws:target".exec = ''
-      uv run cybersec "/aws target"
+      uv run cyberphy "/aws target"
     '';
 
     # Set AWS target region with validation
@@ -1252,22 +1378,22 @@ PY
         echo "Run 'devenv tasks run aws:target:list' for full list."
         exit 1
       fi
-      uv run cybersec "/aws target $REGION"
+      uv run cyberphy "/aws target $REGION"
     '';
 
     # Validate current AWS target without changes (dry-run)
     "aws:target:validate".exec = ''
       REGION="''${1:-}"
       if [ -n "$REGION" ]; then
-        uv run cybersec "/aws target $REGION --dry-run"
+        uv run cyberphy "/aws target $REGION --dry-run"
       else
-        uv run cybersec "/aws target --dry-run"
+        uv run cyberphy "/aws target --dry-run"
       fi
     '';
 
     # List allowed AWS regions
     "aws:target:list".exec = ''
-      uv run cybersec "/aws target --list"
+      uv run cyberphy "/aws target --list"
     '';
 
     "aws:inventory".exec = ''
@@ -2261,26 +2387,26 @@ REMOTE_HEREDOC
     # ============================================================================
 
     "k8s:status".exec = ''
+      source scripts/lab_env.sh
       echo "Kubernetes Stack Status"
       echo "========================"
-
-      # Check for kubeconfig
-      KCONFIG="''${KUBECONFIG:-$PWD/.devenv/state/kubeconfig}"
-      if [ -f "$KCONFIG" ]; then
-        echo "Kubeconfig: $KCONFIG"
-        if kubectl --kubeconfig="$KCONFIG" cluster-info >/dev/null 2>&1; then
+      if resolve_kubeconfig; then
+        echo "Kubeconfig: $KUBECONFIG"
+        echo "Target:     $(detect_k8s_target)"
+        if kubectl --kubeconfig="$KUBECONFIG" cluster-info --request-timeout=5s >/dev/null 2>&1; then
           echo "Cluster: Connected"
-          kubectl --kubeconfig="$KCONFIG" get nodes
+          kubectl --kubeconfig="$KUBECONFIG" get nodes
           echo ""
-          kubectl --kubeconfig="$KCONFIG" get pods -A | grep -E "dask|jupyter" || echo "No Dask/JupyterHub pods"
+          kubectl --kubeconfig="$KUBECONFIG" get pods -A 2>/dev/null | grep -E "dask|jupyter|panel" || echo "No Dask/Jupyter/Panel pods"
         else
-          echo "Cluster: Not reachable"
+          echo "Cluster: Not reachable with this kubeconfig"
         fi
       else
-        echo "No kubeconfig found"
+        echo "No usable kubeconfig found"
         echo ""
         echo "To provision k3d:  devenv tasks run k8s:provision"
         echo "To use RKE2:       export KUBECONFIG=~/.kube/rke2.yaml"
+        echo "  (or: sudo cp /etc/rancher/rke2/rke2.yaml ~/.kube/rke2.yaml && sudo chown \$USER ~/.kube/rke2.yaml)"
       fi
     '';
 
@@ -2692,12 +2818,12 @@ asyncio.run(main())
     "zarf:preflight".exec = ''
       source scripts/polaris_bootstrap_helper.sh
       log_info "=== Zarf Air-Gap Preflight Validation ==="
-      uv run cybersec "/zarf preflight"
+      uv run cyberphy "/zarf preflight"
     '';
 
     "zarf:image".exec = ''
       source scripts/polaris_bootstrap_helper.sh
-      log_info "=== Building Cybersec Dask Image ==="
+      log_info "=== Building Cyberphy Dask Image ==="
 
       # Prefer podman, fallback to docker
       if command -v podman &>/dev/null; then
@@ -2752,6 +2878,14 @@ asyncio.run(main())
         log_error "Custom image not found. Run: devenv tasks run zarf:image"
         exit 1
       fi
+
+      # sample-notebooks ConfigMap is a packaged file — re-embed so HDF5 +
+      # generate_hdf5.py + cluster_env.py land in JupyterHub in situ.
+      log_info "Embedding/verifying sample notebooks ConfigMap..."
+      python3 zarf/scripts/verify-sample-notebooks.py || {
+        log_error "sample notebooks gate failed — fix zarf/notebooks/ then retry"
+        exit 1
+      }
 
       cd zarf
       log_info "Running zarf package create..."
@@ -2885,66 +3019,18 @@ asyncio.run(main())
 
     "zarf:local:preflight".exec = ''
       source scripts/polaris_bootstrap_helper.sh
+      source scripts/lab_env.sh
       log_info "=== Local Zarf Deployment Preflight ==="
 
-      # --- Detect kubeconfig (with permission-aware fallback) ---
-      _resolve_kubeconfig() {
-        # 1. Explicit KUBECONFIG
-        if [ -n "''${KUBECONFIG:-}" ] && [ -f "$KUBECONFIG" ]; then
-          if [ -r "$KUBECONFIG" ]; then
-            log_info "Using KUBECONFIG=$KUBECONFIG"
-            return 0
-          else
-            log_warn "KUBECONFIG=$KUBECONFIG exists but is not readable"
-          fi
-        fi
-        # 2. User-readable copy at ~/.kube/rke2.yaml
-        if [ -f "$HOME/.kube/rke2.yaml" ] && [ -r "$HOME/.kube/rke2.yaml" ]; then
-          KUBECONFIG="$HOME/.kube/rke2.yaml"
-          export KUBECONFIG
-          log_info "Using user kubeconfig: $KUBECONFIG"
-          return 0
-        fi
-        # 3. k3d kubeconfig
-        if [ "''${CYBERSEC_K8S_TARGET:-}" = "k3d" ]; then
-          KUBECONFIG="''${DEVENV_STATE:-.devenv/state}/kubeconfig"
-          export KUBECONFIG
-          log_info "Using k3d kubeconfig: $KUBECONFIG"
-          return 0
-        fi
-        # 4. System RKE2 kubeconfig (may need permission fix)
-        if [ -f "/etc/rancher/rke2/rke2.yaml" ]; then
-          if [ -r "/etc/rancher/rke2/rke2.yaml" ]; then
-            KUBECONFIG="/etc/rancher/rke2/rke2.yaml"
-            export KUBECONFIG
-            log_info "Using RKE2 kubeconfig: $KUBECONFIG"
-            return 0
-          else
-            log_error "RKE2 kubeconfig exists but is not readable: /etc/rancher/rke2/rke2.yaml"
-            echo ""
-            echo "Fix with:"
-            echo "  sudo cp /etc/rancher/rke2/rke2.yaml ~/.kube/rke2.yaml"
-            echo "  sudo chown \$(id -u):\$(id -g) ~/.kube/rke2.yaml"
-            echo "  export KUBECONFIG=~/.kube/rke2.yaml"
-            return 1
-          fi
-        fi
-        # 5. Default kubeconfig
-        if [ -f "$HOME/.kube/config" ] && [ -r "$HOME/.kube/config" ]; then
-          KUBECONFIG="$HOME/.kube/config"
-          export KUBECONFIG
-          log_info "Using default kubeconfig: $KUBECONFIG"
-          return 0
-        fi
-        log_error "No kubeconfig found. Set KUBECONFIG or install a local cluster."
-        return 1
-      }
-      _resolve_kubeconfig || exit 1
+      resolve_kubeconfig || { log_error "No usable kubeconfig (try ~/.kube/rke2.yaml)"; exit 1; }
+      log_info "KUBECONFIG=$KUBECONFIG target=$(detect_k8s_target)"
+      ensure_local_s3_env
 
-      # --- Quick MinIO check ---
-      S3_PORT="''${LOCAL_S3_PORT:-9010}"
-      if ! curl -sf --max-time 5 "http://localhost:''${S3_PORT}/minio/health/live" >/dev/null 2>&1; then
-        log_warn "MinIO not running on localhost:''${S3_PORT}. Required for local deployment: devenv up -d"
+      # --- Quick local S3 (RustFS) check ---
+      if ! rustfs_up "http://localhost:''${LOCAL_S3_PORT:-9010}"; then
+        log_warn "Local S3 (RustFS) not running on :''${LOCAL_S3_PORT:-9010}. Required: devenv up -d"
+      else
+        log_success "RustFS healthy on :''${LOCAL_S3_PORT:-9010}"
       fi
 
       # --- Gather config and run conftest ---
@@ -2984,43 +3070,14 @@ print('Config written to build/environment.json')
 
     "zarf:local:init".exec = ''
       source scripts/polaris_bootstrap_helper.sh
+      source scripts/lab_env.sh
       log_info "=== Local Zarf Init (disk-light) ==="
 
-      # --- Detect kubeconfig (with permission-aware fallback) ---
-      _resolve_kubeconfig() {
-        if [ -n "''${KUBECONFIG:-}" ] && [ -f "$KUBECONFIG" ]; then
-          if [ -r "$KUBECONFIG" ]; then
-            log_info "Using KUBECONFIG=$KUBECONFIG"
-            return 0
-          else
-            log_warn "KUBECONFIG=$KUBECONFIG exists but is not readable"
-          fi
-        fi
-        if [ -f "$HOME/.kube/rke2.yaml" ] && [ -r "$HOME/.kube/rke2.yaml" ]; then
-          KUBECONFIG="$HOME/.kube/rke2.yaml"; export KUBECONFIG
-          log_info "Using user kubeconfig: $KUBECONFIG"; return 0
-        fi
-        if [ "''${CYBERSEC_K8S_TARGET:-}" = "k3d" ]; then
-          KUBECONFIG="''${DEVENV_STATE:-.devenv/state}/kubeconfig"; export KUBECONFIG
-          log_info "Using k3d kubeconfig: $KUBECONFIG"; return 0
-        fi
-        if [ -f "/etc/rancher/rke2/rke2.yaml" ]; then
-          if [ -r "/etc/rancher/rke2/rke2.yaml" ]; then
-            KUBECONFIG="/etc/rancher/rke2/rke2.yaml"; export KUBECONFIG
-            log_info "Using RKE2 kubeconfig: $KUBECONFIG"; return 0
-          else
-            log_error "RKE2 kubeconfig not readable. Fix: sudo cp /etc/rancher/rke2/rke2.yaml ~/.kube/rke2.yaml && sudo chown \$(id -u):\$(id -g) ~/.kube/rke2.yaml"
-            return 1
-          fi
-        fi
-        if [ -f "$HOME/.kube/config" ] && [ -r "$HOME/.kube/config" ]; then
-          KUBECONFIG="$HOME/.kube/config"; export KUBECONFIG
-          log_info "Using default kubeconfig: $KUBECONFIG"; return 0
-        fi
-        log_error "No kubeconfig found. Set KUBECONFIG."
-        return 1
+      resolve_kubeconfig || {
+        log_error "No usable kubeconfig. Fix: sudo cp /etc/rancher/rke2/rke2.yaml ~/.kube/rke2.yaml && sudo chown \$(id -u):\$(id -g) ~/.kube/rke2.yaml"
+        exit 1
       }
-      _resolve_kubeconfig || exit 1
+      log_info "KUBECONFIG=$KUBECONFIG target=$(detect_k8s_target)"
 
       # --- Check if already initialized ---
       if kubectl get ns zarf &>/dev/null; then
@@ -3080,43 +3137,12 @@ print('Config written to build/environment.json')
 
     "zarf:local:deploy".exec = ''
       source scripts/polaris_bootstrap_helper.sh
+      source scripts/lab_env.sh
       log_info "=== Local Zarf Deploy ==="
 
-      # --- Detect kubeconfig (with permission-aware fallback) ---
-      _resolve_kubeconfig() {
-        if [ -n "''${KUBECONFIG:-}" ] && [ -f "$KUBECONFIG" ]; then
-          if [ -r "$KUBECONFIG" ]; then
-            log_info "Using KUBECONFIG=$KUBECONFIG"
-            return 0
-          else
-            log_warn "KUBECONFIG=$KUBECONFIG exists but is not readable"
-          fi
-        fi
-        if [ -f "$HOME/.kube/rke2.yaml" ] && [ -r "$HOME/.kube/rke2.yaml" ]; then
-          KUBECONFIG="$HOME/.kube/rke2.yaml"; export KUBECONFIG
-          log_info "Using user kubeconfig: $KUBECONFIG"; return 0
-        fi
-        if [ "''${CYBERSEC_K8S_TARGET:-}" = "k3d" ]; then
-          KUBECONFIG="''${DEVENV_STATE:-.devenv/state}/kubeconfig"; export KUBECONFIG
-          log_info "Using k3d kubeconfig: $KUBECONFIG"; return 0
-        fi
-        if [ -f "/etc/rancher/rke2/rke2.yaml" ]; then
-          if [ -r "/etc/rancher/rke2/rke2.yaml" ]; then
-            KUBECONFIG="/etc/rancher/rke2/rke2.yaml"; export KUBECONFIG
-            log_info "Using RKE2 kubeconfig: $KUBECONFIG"; return 0
-          else
-            log_error "RKE2 kubeconfig not readable. Fix: sudo cp /etc/rancher/rke2/rke2.yaml ~/.kube/rke2.yaml && sudo chown \$(id -u):\$(id -g) ~/.kube/rke2.yaml"
-            return 1
-          fi
-        fi
-        if [ -f "$HOME/.kube/config" ] && [ -r "$HOME/.kube/config" ]; then
-          KUBECONFIG="$HOME/.kube/config"; export KUBECONFIG
-          log_info "Using default kubeconfig: $KUBECONFIG"; return 0
-        fi
-        log_error "No kubeconfig found. Set KUBECONFIG."
-        return 1
-      }
-      _resolve_kubeconfig || exit 1
+      resolve_kubeconfig || { log_error "No usable kubeconfig"; exit 1; }
+      log_info "KUBECONFIG=$KUBECONFIG target=$(detect_k8s_target)"
+      ensure_local_s3_env
 
       # --- Verify Zarf is initialized ---
       if ! kubectl get ns zarf &>/dev/null; then
@@ -3124,45 +3150,53 @@ print('Config written to build/environment.json')
         exit 1
       fi
 
-      # --- Find deploy package ---
-      cd zarf
-      PKG=$(ls -t zarf-package-cybersec-dask-*.tar.zst 2>/dev/null | head -1)
+      # --- Find deploy package (prefer mirror 1.6.5+) ---
+      PKG=$(find_zarf_package) || true
       if [ -z "$PKG" ]; then
-        log_error "No deploy package found. Run: devenv tasks run zarf:package"
+        log_error "No deploy package found (build/cyberphy-release-mirror or zarf/)"
         exit 1
       fi
+      # zarf CLI wants CWD-relative or absolute path
+      PKG=$(readlink -f "$PKG")
 
-      WORKERS="''${DASK_WORKER_REPLICAS:-2}"
+      # Multi-core lab default 4; override DASK_WORKER_REPLICAS=1 for tiny hosts
+      WORKERS="''${DASK_WORKER_REPLICAS:-4}"
       SPILL_DIR="''${DASK_SPILL_DIR:-}"
       S3_PORT="''${LOCAL_S3_PORT:-9010}"
 
-      # --- Detect MinIO endpoint for K8s pods ---
-      NODE_IP=$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}' | awk '{print $1}')
+      # --- Detect local S3 (RustFS) endpoint for K8s pods ---
+      NODE_IP=$(detect_node_ip)
+      if [ -z "$NODE_IP" ] || [ "$NODE_IP" = "127.0.0.1" ]; then
+        NODE_IP=$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}' | awk '{print $1}')
+      fi
       if [ -z "$NODE_IP" ]; then
         log_error "Cannot detect node InternalIP. Is the cluster running?"
         exit 1
       fi
 
-      # Verify MinIO reachable at node IP (confirms 0.0.0.0 binding works)
-      if ! curl -sf --max-time 5 "http://''${NODE_IP}:''${S3_PORT}/minio/health/live" >/dev/null 2>&1; then
-        if curl -sf --max-time 5 "http://localhost:''${S3_PORT}/minio/health/live" >/dev/null 2>&1; then
-          log_warn "MinIO reachable at localhost but not at ''${NODE_IP}:''${S3_PORT} — pods may fail"
+      if ! rustfs_up "http://''${NODE_IP}:''${S3_PORT}"; then
+        if rustfs_up "http://localhost:''${S3_PORT}"; then
+          log_warn "RustFS reachable at localhost but not at ''${NODE_IP}:''${S3_PORT} — pods may fail"
         else
-          log_error "MinIO not running. Start with: devenv up -d"
+          log_error "RustFS not running. Start with: devenv up -d"
           exit 1
         fi
       fi
 
       S3_EP="http://''${NODE_IP}:''${S3_PORT}"
-      S3_AK="''${MINIO_ACCESS_KEY:-minioadmin}"
-      S3_SK="''${MINIO_SECRET_KEY:-minioadmin}"
-      S3_BK="cybersec"
-      S3_RG="us-east-1"
+      S3_AK="''${RUSTFS_ACCESS_KEY:-''${MINIO_ACCESS_KEY:-admin}}"
+      S3_SK="''${RUSTFS_SECRET_KEY:-''${MINIO_SECRET_KEY:-admin}}"
+      S3_BK="''${S3_BUCKET:-cyberphy}"
+      S3_RG="''${S3_REGION:-us-east-1}"
 
       log_info "Deploying: $PKG"
       log_info "Workers: $WORKERS"
       log_info "Spill dir: ''${SPILL_DIR:-emptyDir (disk-light)}"
-      log_info "S3 endpoint: $S3_EP (MinIO on node $NODE_IP)"
+      log_info "S3 endpoint: $S3_EP (RustFS on node $NODE_IP) bucket=$S3_BK"
+
+      # Secrets via env (ZARF_VAR_*) when supported; also pass --set for non-secrets
+      export ZARF_VAR_S3_ACCESS_KEY="$S3_AK"
+      export ZARF_VAR_S3_SECRET_KEY="$S3_SK"
 
       zarf package deploy "$PKG" --confirm \
         --set DASK_WORKER_REPLICAS="$WORKERS" \
@@ -3266,43 +3300,14 @@ print('Config written to build/environment.json')
 
     "zarf:local:deploy-dashboard".exec = ''
       source scripts/polaris_bootstrap_helper.sh
+      source scripts/lab_env.sh
       log_info "=== Deploying K8s Dashboard ==="
 
-      # --- Detect kubeconfig (with permission-aware fallback) ---
-      _resolve_kubeconfig() {
-        if [ -n "''${KUBECONFIG:-}" ] && [ -f "$KUBECONFIG" ]; then
-          if [ -r "$KUBECONFIG" ]; then
-            log_info "Using KUBECONFIG=$KUBECONFIG"
-            return 0
-          else
-            log_warn "KUBECONFIG=$KUBECONFIG exists but is not readable"
-          fi
-        fi
-        if [ -f "$HOME/.kube/rke2.yaml" ] && [ -r "$HOME/.kube/rke2.yaml" ]; then
-          KUBECONFIG="$HOME/.kube/rke2.yaml"; export KUBECONFIG
-          log_info "Using user kubeconfig: $KUBECONFIG"; return 0
-        fi
-        if [ "''${CYBERSEC_K8S_TARGET:-}" = "k3d" ]; then
-          KUBECONFIG="''${DEVENV_STATE:-.devenv/state}/kubeconfig"; export KUBECONFIG
-          log_info "Using k3d kubeconfig: $KUBECONFIG"; return 0
-        fi
-        if [ -f "/etc/rancher/rke2/rke2.yaml" ]; then
-          if [ -r "/etc/rancher/rke2/rke2.yaml" ]; then
-            KUBECONFIG="/etc/rancher/rke2/rke2.yaml"; export KUBECONFIG
-            log_info "Using RKE2 kubeconfig: $KUBECONFIG"; return 0
-          else
-            log_error "RKE2 kubeconfig not readable. Fix: sudo cp /etc/rancher/rke2/rke2.yaml ~/.kube/rke2.yaml && sudo chown \$(id -u):\$(id -g) ~/.kube/rke2.yaml"
-            return 1
-          fi
-        fi
-        if [ -f "$HOME/.kube/config" ] && [ -r "$HOME/.kube/config" ]; then
-          KUBECONFIG="$HOME/.kube/config"; export KUBECONFIG
-          log_info "Using default kubeconfig: $KUBECONFIG"; return 0
-        fi
-        log_error "No kubeconfig found. Set KUBECONFIG."
-        return 1
+      resolve_kubeconfig || {
+        log_error "No usable kubeconfig. Fix: sudo cp /etc/rancher/rke2/rke2.yaml ~/.kube/rke2.yaml && sudo chown \$(id -u):\$(id -g) ~/.kube/rke2.yaml"
+        exit 1
       }
-      _resolve_kubeconfig || exit 1
+      log_info "KUBECONFIG=$KUBECONFIG target=$(detect_k8s_target)"
 
       # --- Verify Zarf is initialized ---
       if ! kubectl get ns zarf &>/dev/null; then
@@ -3352,58 +3357,30 @@ print('Config written to build/environment.json')
 
     "zarf:local:status".exec = ''
       source scripts/polaris_bootstrap_helper.sh
+      source scripts/lab_env.sh
       log_info "=== Local Zarf Deployment Status ==="
 
-      # --- Detect kubeconfig (with permission-aware fallback) ---
-      _resolve_kubeconfig() {
-        if [ -n "''${KUBECONFIG:-}" ] && [ -f "$KUBECONFIG" ]; then
-          if [ -r "$KUBECONFIG" ]; then
-            log_info "Using KUBECONFIG=$KUBECONFIG"
-            return 0
-          else
-            log_warn "KUBECONFIG=$KUBECONFIG exists but is not readable"
-          fi
-        fi
-        if [ -f "$HOME/.kube/rke2.yaml" ] && [ -r "$HOME/.kube/rke2.yaml" ]; then
-          KUBECONFIG="$HOME/.kube/rke2.yaml"; export KUBECONFIG
-          log_info "Using user kubeconfig: $KUBECONFIG"; return 0
-        fi
-        if [ "''${CYBERSEC_K8S_TARGET:-}" = "k3d" ]; then
-          KUBECONFIG="''${DEVENV_STATE:-.devenv/state}/kubeconfig"; export KUBECONFIG
-          log_info "Using k3d kubeconfig: $KUBECONFIG"; return 0
-        fi
-        if [ -f "/etc/rancher/rke2/rke2.yaml" ]; then
-          if [ -r "/etc/rancher/rke2/rke2.yaml" ]; then
-            KUBECONFIG="/etc/rancher/rke2/rke2.yaml"; export KUBECONFIG
-            log_info "Using RKE2 kubeconfig: $KUBECONFIG"; return 0
-          else
-            log_error "RKE2 kubeconfig not readable. Fix: sudo cp /etc/rancher/rke2/rke2.yaml ~/.kube/rke2.yaml && sudo chown \$(id -u):\$(id -g) ~/.kube/rke2.yaml"
-            return 1
-          fi
-        fi
-        if [ -f "$HOME/.kube/config" ] && [ -r "$HOME/.kube/config" ]; then
-          KUBECONFIG="$HOME/.kube/config"; export KUBECONFIG
-          log_info "Using default kubeconfig: $KUBECONFIG"; return 0
-        fi
-        log_error "No kubeconfig found. Set KUBECONFIG."
-        return 1
+      resolve_kubeconfig || {
+        log_error "No usable kubeconfig. Fix: sudo cp /etc/rancher/rke2/rke2.yaml ~/.kube/rke2.yaml && sudo chown \$(id -u):\$(id -g) ~/.kube/rke2.yaml"
+        exit 1
       }
-      _resolve_kubeconfig || exit 1
-
-      echo "KUBECONFIG: $KUBECONFIG"
+      ensure_local_s3_env
+      echo "KUBECONFIG: $KUBECONFIG  target=$(detect_k8s_target)"
       echo ""
 
-      # --- MinIO ---
+      # --- Local S3 (RustFS) ---
       S3_PORT="''${LOCAL_S3_PORT:-9010}"
-      echo "MinIO:"
-      if curl -sf --max-time 3 "http://localhost:''${S3_PORT}/minio/health/live" >/dev/null 2>&1; then
+      echo "Local S3 (RustFS):"
+      if rustfs_up "http://localhost:''${S3_PORT}"; then
         log_success "  http://localhost:''${S3_PORT}/ (healthy)"
-        NODE_IP=$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}' 2>/dev/null | awk '{print $1}')
-        NODE_IP="''${NODE_IP:-unknown}"
+        NODE_IP=$(detect_node_ip)
         echo "  Pod endpoint: http://''${NODE_IP}:''${S3_PORT}"
-        echo "  Bucket: cybersec  Credentials: minioadmin/minioadmin"
+        echo "  Bucket: ''${S3_BUCKET:-cyberphy}  Credentials: ''${RUSTFS_ACCESS_KEY:-admin}/''${RUSTFS_SECRET_KEY:-admin}"
       else
         log_warn "  http://localhost:''${S3_PORT}/ (not running — devenv up -d)"
+      fi
+      if pkg=$(find_zarf_package 2>/dev/null); then
+        echo "  Package: $pkg"
       fi
       echo ""
 
@@ -3454,43 +3431,36 @@ print('Config written to build/environment.json')
         echo "  (namespace not found)"
       fi
 
-      # --- Service accessibility ---
+      # --- Service accessibility (NodePorts) ---
       echo ""
       echo "Service Accessibility:"
       PANEL_PORT="''${PANEL_PORT:-30506}"
 
-      # Panel-Viz
-      HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "http://localhost:$PANEL_PORT/" 2>/dev/null || echo "000")
-      if echo "$HTTP_CODE" | grep -q "200\|301\|302"; then
-        log_success "  Panel-Viz:      http://0.0.0.0:$PANEL_PORT/ (HTTP $HTTP_CODE)"
+      if nodeport_up "$PANEL_PORT" /; then
+        log_success "  Panel-Viz:      http://localhost:$PANEL_PORT/"
       else
-        log_warn "  Panel-Viz:      http://0.0.0.0:$PANEL_PORT/ (not accessible, HTTP $HTTP_CODE)"
+        log_warn "  Panel-Viz:      http://localhost:$PANEL_PORT/ (not accessible)"
       fi
 
-      # Dask Dashboard
-      HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "http://localhost:30087/" 2>/dev/null || echo "000")
-      if echo "$HTTP_CODE" | grep -q "200\|301\|302"; then
-        log_success "  Dask Dashboard: http://localhost:30087/ (HTTP $HTTP_CODE)"
+      if nodeport_up 30087 /health || nodeport_up 30087 /; then
+        log_success "  Dask Dashboard: http://localhost:30087/"
       else
-        log_warn "  Dask Dashboard: http://localhost:30087/ (not accessible, HTTP $HTTP_CODE)"
+        log_warn "  Dask Dashboard: http://localhost:30087/ (not accessible)"
       fi
 
-      # JupyterHub
-      HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "http://localhost:30080/" 2>/dev/null || echo "000")
-      if echo "$HTTP_CODE" | grep -q "200\|301\|302"; then
-        log_success "  JupyterHub:     http://localhost:30080/ (HTTP $HTTP_CODE)"
+      if nodeport_up 30080 /hub/login || nodeport_up 30080 /; then
+        log_success "  JupyterHub:     http://localhost:30080/"
       else
-        log_warn "  JupyterHub:     http://localhost:30080/ (not accessible, HTTP $HTTP_CODE)"
+        log_warn "  JupyterHub:     http://localhost:30080/ (not accessible)"
       fi
 
-      # MinIO (pod-reachable via node IP)
-      NODE_IP=$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}' 2>/dev/null | awk '{print $1}')
-      if [ -n "$NODE_IP" ]; then
-        HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "http://''${NODE_IP}:''${S3_PORT}/minio/health/live" 2>/dev/null || echo "000")
-        if echo "$HTTP_CODE" | grep -q "200"; then
-          log_success "  MinIO (pods):   http://''${NODE_IP}:''${S3_PORT}/ (reachable)"
+      # Local S3 / RustFS (pod-reachable via node IP)
+      NODE_IP=$(detect_node_ip)
+      if [ -n "$NODE_IP" ] && [ "$NODE_IP" != "127.0.0.1" ]; then
+        if rustfs_up "http://''${NODE_IP}:''${S3_PORT}"; then
+          log_success "  RustFS (pods):  http://''${NODE_IP}:''${S3_PORT}/ (reachable)"
         else
-          log_warn "  MinIO (pods):   http://''${NODE_IP}:''${S3_PORT}/ (not reachable from node, HTTP $HTTP_CODE)"
+          log_warn "  RustFS (pods):  http://''${NODE_IP}:''${S3_PORT}/ (not reachable from node)"
         fi
       fi
 
@@ -3694,7 +3664,7 @@ print('Config written to build/environment.json')
       # Kill by port - ALL services:
       # 8181/8182: Polaris REST/Admin
       # 5438: PostgreSQL
-      # 9010/9011: MinIO API/Console
+      # 9010/9011: RustFS (local S3) API/Console
       # 8081: Flink
       # 5050: Iceberg Browser
       # 8450: NiFi
@@ -3711,7 +3681,7 @@ print('Config written to build/environment.json')
       done
 
       # Kill remaining service processes using portable pattern matching
-      kill_by_pattern "minio|postgres|flink|taskmanager|jobmanager|quarkus|polaris|otelcol|nifi|cost.monitor"
+      kill_by_pattern "rustfs|minio|postgres|flink|taskmanager|jobmanager|quarkus|polaris|otelcol|nifi|cost.monitor"
 
       # Verify critical ports are released
       log_info "Verifying ports are released..."
@@ -4572,8 +4542,61 @@ EOF
     bootstrap-check = {
       exec = ''
         echo "======================================================"
-        echo "  Cybersec Bootstrap Check"
+        echo "  Cyberphy Bootstrap Check"
         echo "======================================================"
+
+        # Shared lab helpers (RustFS, kubeconfig, package finder)
+        if [ -f "$PWD/scripts/lab_env.sh" ]; then
+          # shellcheck source=/dev/null
+          source "$PWD/scripts/lab_env.sh"
+          ensure_local_s3_env
+        fi
+
+        # --- Plane A: devenv lab (RustFS + Polaris cyberphy) ---
+        echo ""
+        echo "  Lab services:"
+        S3_PORT="''${LOCAL_S3_PORT:-9010}"
+        if command -v rustfs_up >/dev/null 2>&1 && rustfs_up "http://127.0.0.1:''${S3_PORT}"; then
+          echo "  RustFS:     OK (:''${S3_PORT}, bucket=''${S3_BUCKET:-cyberphy})"
+        elif curl -sf --max-time 2 "http://127.0.0.1:''${S3_PORT}/health" >/dev/null 2>&1; then
+          echo "  RustFS:     OK (:''${S3_PORT})"
+        else
+          echo "  RustFS:     DOWN (:''${S3_PORT}) — start with: devenv up"
+        fi
+
+        CATALOG="''${POLARIS_CATALOG_NAME:-cyberphy}"
+        if curl -sf --max-time 2 http://127.0.0.1:8182/q/health/ready >/dev/null 2>&1; then
+          # Best-effort catalog name hint from env / warehouse
+          echo "  Polaris:    OK (catalog=''${CATALOG}, warehouse=''${POLARIS_WAREHOUSE:-s3://cyberphy/iceberg/warehouse})"
+        else
+          echo "  Polaris:    DOWN — polaris-init runs after postgres/rustfs"
+        fi
+
+        # --- Plane B: K8s / Zarf readiness ---
+        echo ""
+        echo "  K8s / Zarf:"
+        if command -v resolve_kubeconfig >/dev/null 2>&1 && resolve_kubeconfig 2>/dev/null; then
+          TGT=$(detect_k8s_target 2>/dev/null || echo unknown)
+          echo "  KUBECONFIG: $KUBECONFIG (target=$TGT)"
+          if kubectl --kubeconfig="$KUBECONFIG" get ns zarf >/dev/null 2>&1; then
+            echo "  Zarf:       initialized (ns=zarf)"
+          else
+            echo "  Zarf:       not initialized — devenv tasks run zarf:local:init"
+          fi
+        else
+          echo "  KUBECONFIG: (none usable)"
+          if systemctl is-active --quiet rke2-server 2>/dev/null; then
+            echo "  RKE2:       active but kubeconfig unreadable"
+            echo "              sudo cp /etc/rancher/rke2/rke2.yaml ~/.kube/rke2.yaml && sudo chown \$USER ~/.kube/rke2.yaml"
+          else
+            echo "  RKE2:       inactive (optional for pure lab)"
+          fi
+        fi
+        if command -v find_zarf_package >/dev/null 2>&1 && pkg=$(find_zarf_package 2>/dev/null); then
+          echo "  Package:    $pkg"
+        else
+          echo "  Package:    (none — build/cyberphy-release-mirror/*/ or zarf/)"
+        fi
 
         # Quick assessment using the bootstrap CLI
         if command -v python &> /dev/null; then
@@ -4614,8 +4637,9 @@ try:
         print()
         print('  Next steps:')
         print('    1. Open http://localhost:5050/settings in your browser')
-        print('    2. Or run: cybersec bootstrap run')
-        print('    3. Or run: python -m cybersec.cli.main bootstrap run')
+        print('    2. Or run: cyberphy bootstrap run')
+        print('    3. Or run: uv run python -m cybersec.cli.main bootstrap run')
+        print('    4. Lab status: devenv tasks run lab:status')
     print()
 except ImportError as e:
     print(f'  Bootstrap module not installed: {e}')
@@ -4626,7 +4650,7 @@ except Exception as e:
     print()
 "
         else
-          echo "  Python not found - skipping bootstrap check"
+          echo "  Python not found - skipping bootstrap assessment"
         fi
 
         echo "======================================================"
@@ -5089,8 +5113,8 @@ except Exception as e:
             --catalog.uri http://localhost:8181 \
             --warehouse.name cybersec \
             --s3.endpoint http://localhost:9010 \
-            --s3.access-key minioadmin \
-            --s3.secret-key minioadmin \
+            --s3.access-key admin \
+            --s3.secret-key admin \
             --rows-per-second "$RPS"
         }
 
@@ -5243,11 +5267,11 @@ except Exception as e:
         echo "REST API will be available at http://localhost:8181"
         echo "Admin API will be available at http://localhost:8182"
         
-        # Configure AWS SDK for MinIO access
+        # Configure AWS SDK for local RustFS (S3-compatible) access
         export AWS_ENDPOINT_URL=http://localhost:9010
         export AWS_REGION=us-east-1
-        export AWS_ACCESS_KEY_ID=minioadmin
-        export AWS_SECRET_ACCESS_KEY=minioadmin
+        export AWS_ACCESS_KEY_ID="''${RUSTFS_ACCESS_KEY:-''${MINIO_ACCESS_KEY:-admin}}"
+        export AWS_SECRET_ACCESS_KEY="''${RUSTFS_SECRET_KEY:-''${MINIO_SECRET_KEY:-admin}}"
         
         # Quarkus environment variables for PostgreSQL persistence
         export QUARKUS_DATASOURCE_DB_KIND=postgresql
@@ -5256,9 +5280,9 @@ except Exception as e:
         export QUARKUS_DATASOURCE_PASSWORD=cybersec
         export POLARIS_PERSISTENCE_TYPE=relational-jdbc
         
-        # AWS SDK v2 properties for S3 endpoint override and Polaris configuration
+        # AWS SDK v2 properties for S3 endpoint override (RustFS path-style)
         # Bind to 0.0.0.0 for WARP/Cloudflare tunnel access
-        export JAVA_TOOL_OPTIONS="-Daws.endpointUrl=http://localhost:9010 -Daws.region=us-east-1 -Dquarkus.http.host=0.0.0.0 -Dquarkus.config.locations=$PWD/conf/application.properties"
+        export JAVA_TOOL_OPTIONS="-Daws.endpointUrl=http://localhost:9010 -Daws.region=us-east-1 -Daws.s3.pathStyleAccessEnabled=true -Dquarkus.http.host=0.0.0.0 -Dquarkus.config.locations=$PWD/conf/application.properties"
         
         # Run Polaris server
         exec ./bin/server
@@ -5281,16 +5305,41 @@ except Exception as e:
           postgres = {
             condition = "process_healthy";
           };
+          # Warehouse objects live on RustFS — wait for S3 before serving catalog
+          rustfs = {
+            condition = "process_healthy";
+          };
         };
       };
     };
 
-    # Automatic Polaris catalog initialization
+    # Automatic Polaris catalog initialization (cyberphy + RustFS warehouse)
     # Runs after Polaris starts, creates catalog with permissions
     # Uses retry logic and verification for robustness
     polaris-init = {
       exec = ''
         source scripts/polaris_bootstrap_helper.sh
+        
+        export POLARIS_CATALOG_NAME="''${POLARIS_CATALOG_NAME:-cyberphy}"
+        export S3_ENDPOINT="''${S3_ENDPOINT:-http://localhost:9010}"
+        export S3_BUCKET="''${S3_BUCKET:-cyberphy}"
+        export S3_ACCESS_KEY="''${RUSTFS_ACCESS_KEY:-''${MINIO_ACCESS_KEY:-''${AWS_ACCESS_KEY_ID:-admin}}}"
+        export S3_SECRET_KEY="''${RUSTFS_SECRET_KEY:-''${MINIO_SECRET_KEY:-''${AWS_SECRET_ACCESS_KEY:-admin}}}"
+        export POLARIS_WAREHOUSE="''${POLARIS_WAREHOUSE:-s3://''${S3_BUCKET}/iceberg/warehouse}"
+
+        # Wait for RustFS before catalog create (warehouse base location)
+        log_info "Waiting for RustFS/S3 at $S3_ENDPOINT ..."
+        for i in $(seq 1 60); do
+          if curl -sf --max-time 2 "$S3_ENDPOINT/health" >/dev/null 2>&1; then
+            log_success "RustFS is ready"
+            break
+          fi
+          if [ "$i" -eq 60 ]; then
+            log_error "RustFS not ready at $S3_ENDPOINT"
+            exit 1
+          fi
+          sleep 2
+        done
         
         # Wait for Polaris to be ready
         if ! wait_for_polaris 60 2; then
@@ -5305,28 +5354,27 @@ except Exception as e:
         fi
         
         # Check if catalog already exists
-        if verify_catalog "cybersec"; then
-          log_success "Catalog 'cybersec' already exists - skipping initialization"
+        if verify_catalog "$POLARIS_CATALOG_NAME"; then
+          log_success "Catalog '$POLARIS_CATALOG_NAME' already exists - skipping initialization"
           exit 0
         fi
         
         # Trigger catalog initialization with retry logic
         if trigger_catalog_init 3 ./setup_polaris_catalog.sh; then
-          log_success "Catalog initialization completed and verified"
+          log_success "Catalog initialization completed and verified ($POLARIS_CATALOG_NAME)"
           exit 0
         else
           echo "Failed to initialize Polaris catalog"
-          cat /tmp/polaris-init.log
+          cat /tmp/polaris-catalog-init.log 2>/dev/null || cat /tmp/polaris-init.log 2>/dev/null || true
           exit 1
         fi
-        
-        # Keep process alive briefly then exit (one-shot initialization)
-        sleep 2
-        echo "Polaris initialization complete - exiting"
       '';
       process-compose = {
         depends_on = {
           polaris = {
+            condition = "process_healthy";
+          };
+          rustfs = {
             condition = "process_healthy";
           };
         };
@@ -5474,8 +5522,8 @@ except Exception as e:
         export NIFI_PID_DIR="$NIFI_STATE/run"
 
         # MinIO/S3 credentials (for NiFi S3 processors)
-        export AWS_ACCESS_KEY_ID="minioadmin"
-        export AWS_SECRET_ACCESS_KEY="minioadmin"
+        export AWS_ACCESS_KEY_ID="admin"
+        export AWS_SECRET_ACCESS_KEY="admin"
         export AWS_ENDPOINT_URL="http://localhost:9010"
 
         cd "$NIFI_PACKAGE"

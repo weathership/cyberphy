@@ -4,7 +4,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Settings - Cybersec Bootstrap</title>
+    <title>Settings - Cyberphy Bootstrap</title>
     <!-- Google Fonts: Orbitron for titles, Inter for UI, JetBrains Mono for data -->
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -96,6 +96,9 @@
             font-size: 0.85em;
             font-weight: 500;
             transition: all 0.2s;
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
         }
 
         .service-link:hover {
@@ -103,6 +106,22 @@
             border-color: var(--color-amber);
             background: rgba(212, 168, 75, 0.1);
         }
+
+        .service-link.svc-up { border-color: rgba(76, 175, 80, 0.55); }
+        .service-link.svc-up::after,
+        .service-link.svc-down::after {
+            content: "";
+            width: 7px;
+            height: 7px;
+            border-radius: 50%;
+            flex-shrink: 0;
+        }
+        .service-link.svc-up::after {
+            background: #4caf50;
+            box-shadow: 0 0 6px rgba(76, 175, 80, 0.7);
+        }
+        .service-link.svc-down { border-color: rgba(244, 67, 54, 0.4); opacity: 0.75; }
+        .service-link.svc-down::after { background: #f44336; }
 
         .card {
             background: var(--color-charcoal);
@@ -568,12 +587,12 @@
     <header>
         <div class="container">
             <h1>Settings</h1>
-            <p>Cybersec Bootstrap Configuration</p>
+            <p>Cyberphy Bootstrap Configuration</p>
             <div class="service-links" id="service-links">
                 <a href="/" class="service-link">Events</a>
                 <a href="/polaris" class="service-link">Polaris</a>
                 <a href="{{ service_urls.flink }}" target="_blank" class="service-link" data-service="flink">Flink</a>
-                <a href="{{ service_urls.minio_console }}" target="_blank" class="service-link" data-service="minio_console">MinIO</a>
+                <a href="{{ service_urls.rustfs_console or service_urls.minio_console }}" target="_blank" class="service-link" data-service="rustfs_console">RustFS</a>
                 <a href="{{ service_urls.nifi }}" target="_blank" class="service-link" data-service="nifi">NiFi</a>
                 <a href="{{ service_urls.viz }}" target="_blank" class="service-link" data-service="viz">Viz</a>
                 <a href="{{ service_urls.dask }}" target="_blank" class="service-link" data-service="dask">Dask</a>
@@ -715,8 +734,8 @@
                                     <span class="hint">Leave empty to build from source</span>
                                 </div>
                                 <div class="config-field">
-                                    <label for="minio_data_dir">MinIO Data Directory</label>
-                                    <input type="text" id="minio_data_dir" placeholder="e.g., $DEVENV_STATE/minio">
+                                    <label for="minio_data_dir">RustFS Data Directory</label>
+                                    <input type="text" id="minio_data_dir" placeholder="e.g., /raid/build/cyberphy/data or $DEVENV_STATE/rustfs/data">
                                 </div>
                             </div>
                         </div>
@@ -820,11 +839,29 @@
             document.getElementById(`${tabName}-tab`).classList.add('active');
         }
 
+        async function probeServiceLinks() {
+            try {
+                const response = await fetch('/api/services/health');
+                if (!response.ok) return;
+                const data = await response.json();
+                const services = data.services || {};
+                document.querySelectorAll('.service-link[data-service]').forEach((el) => {
+                    const key = el.getAttribute('data-service');
+                    const info = services[key];
+                    el.classList.remove('svc-up', 'svc-down');
+                    if (!info) return;
+                    el.classList.add(info.up ? 'svc-up' : 'svc-down');
+                });
+            } catch (e) { /* ignore */ }
+        }
+
         // Load status on page load
         document.addEventListener('DOMContentLoaded', () => {
             loadStatus();
             loadSettings();
             checkBootstrapNeeded();
+            probeServiceLinks();
+            setInterval(probeServiceLinks, 15000);
         });
 
         // Check if bootstrap is needed
