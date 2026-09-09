@@ -13,3 +13,7 @@
 [submodule "thirdparty/cdpcli"]
 	path = thirdparty/cdpcli
 	url = https://github.com/rch/cldr-cdpcli.git
+[submodule "external/nautilus"]
+	path = external/nautilus
+	url = git@github.com:weathership/nautilus.git
+	branch = trunk
